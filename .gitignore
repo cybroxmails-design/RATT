@@ -1,0 +1,38 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyInstaller / Build artifacts
+build/
+dist/
+*.spec.bak
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# User session, secrets and cache (never commit credentials!)
+services.json
+session.json
+menu.log
+*.log
+
+# Generated test/temporary files
+test*.html
+test*.pdf
+test_*.py
+
+# IDE / Editor folders
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS generated files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
