@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 
 from ratt.ui.styles import *
 from ratt.config import config
-from ratt.translation import SUPPORTED_LANGUAGES, get_language_names
+from ratt.translation import get_language_names
 
 
 class TranslateDialog:
@@ -71,7 +71,11 @@ class TranslateDialog:
         slot_frame.pack(fill=tk.X, pady=(0, 12))
         
         self.slot_var = tk.IntVar(value=slot_num or 1)
-        for i in range(1, config.max_slots + 1):
+        filled_nums = sorted(self.app.clipboard_manager.get_all_slots().keys())
+        display_slots = filled_nums if filled_nums else list(range(1, min(config.max_slots, 10) + 1))
+        if slot_num is None and filled_nums:
+            self.slot_var.set(filled_nums[0])
+        for idx, i in enumerate(display_slots[:20]):
             slot = self.app.clipboard_manager.get_slot(i)
             has_content = slot is not None and not slot.is_empty
             color = get_slot_color(i)
@@ -83,7 +87,7 @@ class TranslateDialog:
                 activebackground=BG_PRIMARY, activeforeground=TEXT_PRIMARY,
                 state=tk.NORMAL if has_content else tk.DISABLED
             )
-            rb.grid(row=0, column=i-1, padx=2)
+            rb.grid(row=idx // 10, column=idx % 10, padx=2)
         
         # Target language
         tk.Label(
@@ -165,6 +169,9 @@ class TranslateDialog:
         slot = self.app.clipboard_manager.get_slot(slot_num)
         if not slot or slot.is_empty:
             messagebox.showwarning("Empty Slot", "The selected slot is empty.", parent=self.dialog)
+            return
+
+        if not TranslationManager().ensure_consent(self.dialog):
             return
 
         target_lang = self.lang_var.get()

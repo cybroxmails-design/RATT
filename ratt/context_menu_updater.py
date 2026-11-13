@@ -1,245 +1,273 @@
-"""Dynamic right-click menu updater.
+"""Right-click menu: one "RATT" entry with everything cascading under it.
 
-Keeps the Windows "RATT >" menu in sync with the app and makes every entry do something:
+    RATT >  Open RATT
+            Copy to Slot  > Slot 1 ... Slot N        (N = slots on the user's plan)
+            Cut to Slot   > Slot 1 ... Slot N
+            Paste from Slot > slots that hold data
+            Share / Mirror                            (Basic: 7-day trial, then greyed out)
+            Translate > Language > Slot               (Premium / Enterprise)
 
-  * Copy / Cut to Slot  - one entry per slot of the user's plan
-  * Paste from Slot     - only slots that currently hold data
-  * Share / Mirror      - 7-day trial countdown for Basic, greyed out afterwards
-  * Translate           - Premium/Enterprise: pick a language, RATT translates the
-                          active slot (last slot used) and pastes it into the document
-  * a coloured dot icon marks every slot that has data (same colour as in RATT);
-    it disappears when the slot is cleared
+A slot that holds data gets a dot in the same colour it has in the RATT window; the dot
+disappears when the slot is cleared.
 
-Each entry launches RATT.vbs with an action ("copy 3", "translate fr", ...). The running
-RATT instance receives it and performs the action.
+How it works: Windows limits a menu made of registry entries to 16 entries in total, far
+too few. So the menu is drawn by a small shell extension (assets\ratt_menu.dll, source in
+shellext\ratt_menu.c) that reads %APPDATA%\RATT\menu_state.txt. This module installs the
+extension once and rewrites that text file whenever the slots or the plan change.
 
-Windows limits a cascading menu to about 16 entries, so plans with more slots list the
-first 15 plus "More slots..." (opens the RATT popup, which lists every slot).
+    python -m ratt.context_menu_updater --unregister      removes the menu again
 """
 import os
 import sys
 import threading
-import time
 import winreg
+
+from ratt import native
+
+CLSID = "{B2D6C4A1-3E7F-4C59-9A18-5D0E7F6A4B21}"
+HANDLER_KEYS = [
+    r"Software\Classes\*\shellex\ContextMenuHandlers\RATT",
+    r"Software\Classes\Directory\shellex\ContextMenuHandlers\RATT",
+    r"Software\Classes\Directory\Background\shellex\ContextMenuHandlers\RATT",
+]
+# Registry-only menus written by earlier versions of RATT; removed so they don't show twice.
+OLD_MENU_KEYS = [
+    rf"Software\Classes\{place}\shell\{name}"
+    for place in ("*", "Directory", r"Directory\Background")
+    for name in ("RATT", "RATT_02_copy", "RATT_03_cut", "RATT_04_translate")
+]
+
+MENU_CAP = 40              # slots listed per submenu, then "More slots..."
+RETRY_SECONDS = 60         # while Windows refuses to load the (unsigned) extension
 
 _lock = threading.Lock()
 _last_state = None
 
-MAX_ENTRIES = 16
-_LOCATIONS = [
-    r"Software\Classes\*\shell\RATT",
-    r"Software\Classes\Directory\Background\shell\RATT",
-    r"Software\Classes\Directory\shell\RATT",
-]
 
+# ---- state -------------------------------------------------------------------------
 
-def _app_dir():
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _log(msg):
-    try:
-        folder = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RATT")
-        os.makedirs(folder, exist_ok=True)
-        with open(os.path.join(folder, "menu.log"), "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
-    except Exception:
-        pass
+def build_state(config, clipboard_manager=None):
+    """Everything the menu depends on, as plain comparable values."""
+    from ratt.config import TRANSLATE_LANGUAGES
+    user = config.user
+    filled = tuple(sorted(clipboard_manager.get_all_slots())) if clipboard_manager else ()
+    return {
+        "enabled": bool(getattr(config, "enabled", True)),
+        "num_slots": int(config.max_slots),
+        "filled": filled,
+        "premium": bool(config.is_premium),
+        "trial_active": bool(user.is_trial_active),
+        "trial_days": int(user.trial_days_remaining),
+        "languages": tuple(TRANSLATE_LANGUAGES),
+    }
 
 
 def update_context_menu(config, clipboard_manager):
-    """Snapshot state on the caller's thread, then rewrite the registry in the background."""
+    """Called by the app whenever slots or plan change. The snapshot is taken on the
+    caller's thread; the file and registry work happens in the background."""
     try:
-        from ratt.config import TRANSLATE_LANGUAGES
-        user = config.user
-        state = {
-            "num_slots": int(config.max_slots),
-            "filled": tuple(sorted(clipboard_manager.get_all_slots().keys())),
-            "active": clipboard_manager.active_slot(),
-            "premium": bool(config.is_premium),
-            "trial_active": bool(user.is_trial_active),
-            "trial_days": int(user.trial_days_remaining),
-            "languages": tuple(TRANSLATE_LANGUAGES),
-        }
-    except Exception as e:
-        _log(f"snapshot failed: {e!r}")
+        state = build_state(config, clipboard_manager)
+    except Exception as error:
+        native.log("menu", f"snapshot failed: {error!r}")
         return
-    threading.Thread(target=_do_update, args=(state,), daemon=True).start()
+    threading.Thread(target=_apply, args=(state,), daemon=True).start()
 
 
-def _make_dot_icon(color_hex):
-    """Create (once) a small round dot .ico in the given colour and return its path."""
-    from PIL import Image, ImageDraw
-    folder = os.path.join(_app_dir(), "assets", "dots")
-    os.makedirs(folder, exist_ok=True)
-    path = os.path.join(folder, f"dot_{color_hex.lstrip('#').lower()}.ico")
-    if os.path.exists(path):
-        return path
-    S = 256
-    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
-    d = ImageDraw.Draw(img)
-    pad = int(S * 0.18)
-    d.ellipse([pad, pad, S - pad, S - pad], fill=color_hex)
-    img.save(path, format="ICO", sizes=[(16, 16), (20, 20), (24, 24), (32, 32)])
+def _apply(state):
+    global _last_state
+    with _lock:
+        if state == _last_state:
+            return
+        try:
+            _write_state_file(state)
+            dll = native.install("ratt_menu.dll")
+            _register(dll)
+            if native.can_load(dll):
+                _remove_old_menus()
+                _last_state = state
+            else:
+                if state.get("enabled", True):
+                    _register_fallback_menus(state)
+                else:
+                    _remove_old_menus()
+                raise OSError("Windows refused to load the menu extension (Application Control); using registry menu fallback")
+        except Exception as error:
+            native.log("menu", f"menu not updated, retrying: {error!r}")
+            timer = threading.Timer(RETRY_SECONDS, _apply, args=(state,))
+            timer.daemon = True
+            timer.start()
+
+
+# ---- the menu description read by the extension --------------------------------------
+
+def _logo_file():
+    """64x64 premultiplied BGRA copy of the RATT logo (the extension scales it)."""
+    import struct
+    from PIL import Image
+    path = os.path.join(native.data_dir(), "ratt_menu_logo.raw")
+    if not os.path.exists(path):
+        image = Image.open(os.path.join(native.assets_dir(), "ratt_icon.png")).convert("RGBA").resize((64, 64))
+        data = bytearray(struct.pack("<II", 64, 64))
+        for r, g, b, a in image.getdata():
+            data += bytes((b * a // 255, g * a // 255, r * a // 255, a))
+        with open(path, "wb") as f:
+            f.write(data)
     return path
 
 
-def _delete_tree(base, path):
+def _write_state_file(state):
+    """Line format (tab separated) is documented at the top of shellext\\ratt_menu.c."""
+    path = os.path.join(native.data_dir(), "menu_state.txt")
+    if not state.get("enabled", True):
+        with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+            f.write("DISABLED\n")
+        os.replace(path + ".tmp", path)
+        return
+
+    from ratt.ui.styles import get_slot_color
+    filled = list(state["filled"])
+    all_slots = list(range(1, state["num_slots"] + 1))
+    program, prefix = native.launch_command()
+    lines = [f"LAUNCH\t{program}\t{prefix}", f"LOGO\t{_logo_file()}"]
+
+    def add(depth, kind, label, args="-", dot="-"):
+        """kind: M = submenu, I = item, D = disabled item"""
+        lines.append(f"ITEM\t{depth}\t{kind}\t{dot}\t{args}\t{label}")
+
+    def add_slots(depth, numbers, action, language=None):
+        for n in numbers[:MENU_CAP]:
+            args = f"{action} {language} {n}" if language else f"{action} {n}"
+            add(depth, "I", f"Slot {n}", args, get_slot_color(n).lstrip("#") if n in filled else "-")
+        if len(numbers) > MENU_CAP:
+            add(depth, "I", "More slots... (open RATT)", "popup")
+
+    add(0, "I", "Open RATT", "open")
+    add(0, "M", "Copy to Slot")
+    add_slots(1, all_slots, "copy")
+    add(0, "M", "Cut to Slot")
+    add_slots(1, all_slots, "cut")
+    add(0, "M", "Paste from Slot")
+    if filled:
+        add_slots(1, filled, "paste")
+    else:
+        add(1, "D", "(no slot has data yet)")
+
+    for name, action in (("Share", "share"), ("Mirror", "mirror")):
+        days = state["trial_days"]
+        if state["premium"]:
+            add(0, "I", name, action)
+        elif state["trial_active"]:
+            add(0, "I", f"{name} ({days} day{'s' if days != 1 else ''} left)", action)
+        else:
+            add(0, "D", f"{name} (trial ended)")
+
+    if state["premium"]:
+        add(0, "M", "Translate")
+        for code, language in state["languages"]:
+            add(1, "M", language)
+            if filled:
+                add_slots(2, filled, "translate", code)
+            else:
+                add(2, "D", "(no slot has data yet)")
+        add(0, "M", "Android Keyboard (IME)")
+        add_slots(1, all_slots, "android-copy")
+        add(0, "M", "iOS Keyboard (iPhone)")
+        add_slots(1, all_slots, "ios-copy")
+    else:
+        add(0, "D", "Translate (Premium / Enterprise)")
+        add(0, "I", "Android Keyboard (Premium / Enterprise)", "android")
+        add(0, "I", "iOS Keyboard (Premium / Enterprise)", "ios")
+
+    path = os.path.join(native.data_dir(), "menu_state.txt")
+    with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(lines) + "\n")
+    os.replace(path + ".tmp", path)
+
+
+# ---- registry ----------------------------------------------------------------------
+
+def _set(path, **values):
+    with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_WRITE) as key:
+        for name, value in values.items():
+            winreg.SetValueEx(key, "" if name == "default" else name, 0, winreg.REG_SZ, value)
+
+
+def _delete_tree(path):
     try:
-        with winreg.OpenKeyEx(base, path, 0, winreg.KEY_READ) as k:
-            subs, i = [], 0
+        with winreg.OpenKeyEx(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ) as key:
+            children = []
             while True:
                 try:
-                    subs.append(winreg.EnumKey(k, i))
-                    i += 1
+                    children.append(winreg.EnumKey(key, len(children)))
                 except OSError:
                     break
-        for s in subs:
-            _delete_tree(base, path + "\\" + s)
-        winreg.DeleteKey(base, path)
+        for child in children:
+            _delete_tree(path + "\\" + child)
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
     except FileNotFoundError:
         pass
 
 
-def _del_value(base, path, name):
+def _should_register_hkcu() -> bool:
+    """Skip HKCU registration when a system-wide Program Files installation already owns the CLSID."""
     try:
-        with winreg.OpenKeyEx(base, path, 0, winreg.KEY_SET_VALUE) as k:
-            winreg.DeleteValue(k, name)
-    except (FileNotFoundError, OSError):
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"Software\Classes\CLSID\{CLSID}\InProcServer32") as k:
+            val, _ = winreg.QueryValueEx(k, "")
+            if isinstance(val, str) and "program files" in val.lower():
+                return False
+    except OSError:
         pass
+    return True
 
 
-def _set_values(base, path, **vals):
-    with winreg.CreateKeyEx(base, path, 0, winreg.KEY_WRITE) as k:
-        for name, v in vals.items():
-            if isinstance(v, int):
-                winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, v)
-            else:
-                winreg.SetValueEx(k, name, 0, winreg.REG_SZ, v)
+def _register(dll):
+    """Point Explorer's context-menu handlers (files, folders, folder background) at the DLL."""
+    if not _should_register_hkcu():
+        return
+    _set(rf"Software\Classes\CLSID\{CLSID}", default="RATT right-click menu")
+    _set(rf"Software\Classes\CLSID\{CLSID}\InProcServer32", default=dll, ThreadingModel="Apartment")
+    for key in HANDLER_KEYS:
+        _set(key, default=CLSID)
 
 
-def _entry(base, parent_shell, key, label, cmd, icon=None, disabled=False):
-    path = f"{parent_shell}\\{key}"
-    _set_values(base, path, MUIVerb=label)
-    if icon:
-        _set_values(base, path, Icon=icon)
+def _remove_old_menus():
+    for key in OLD_MENU_KEYS:
+        _delete_tree(key)
+
+
+def _register_fallback_menus(state):
+    """Fallback Windows Registry cascading menu if Smart App Control blocks the COM DLL."""
+    program, prefix = native.launch_command()
+    icon = os.path.join(native.assets_dir(), "ratt_icon.ico")
+    cmd_base = f'"{program}" {prefix}'.strip()
+    for place in ("*", "Directory", r"Directory\Background"):
+        root = rf"Software\Classes\{place}\shell\RATT"
+        _set(root, MUIVerb="RATT", Icon=icon, SubCommands="")
+        _set(rf"{root}\shell\01_open", MUIVerb="Open RATT", Icon=icon)
+        _set(rf"{root}\shell\01_open\command", default=f"{cmd_base} open")
+        _set(rf"{root}\shell\02_popup", MUIVerb="RATT Slots Menu (Copy / Cut / Paste)")
+        _set(rf"{root}\shell\02_popup\command", default=f"{cmd_base} popup")
+        for idx in range(1, min(state["num_slots"], 10) + 1):
+            _set(rf"{root}\shell\1{idx:02d}_copy", MUIVerb=f"Copy to Slot {idx}")
+            cmd = f'{cmd_base} copy {idx} "%1"' if place != r"Directory\Background" else f"{cmd_base} copy {idx}"
+            _set(rf"{root}\shell\1{idx:02d}_copy\command", default=cmd)
+        for idx in list(state["filled"])[:5]:
+            _set(rf"{root}\shell\2{idx:02d}_paste", MUIVerb=f"Paste from Slot {idx}")
+            cmd = f'{cmd_base} paste {idx} "%1"' if place != r"Directory\Background" else f"{cmd_base} paste {idx}"
+            _set(rf"{root}\shell\2{idx:02d}_paste\command", default=cmd)
+
+
+def unregister():
+    """Remove RATT from the right-click menu completely."""
+    for key in HANDLER_KEYS:
+        _delete_tree(key)
+    _delete_tree(rf"Software\Classes\CLSID\{CLSID}")
+    _remove_old_menus()
+
+
+if __name__ == "__main__":
+    if "--unregister" in sys.argv:
+        unregister()
+        print("RATT removed from the right-click menu.")
     else:
-        _del_value(base, path, "Icon")
-    if disabled:
-        _set_values(base, path, LegacyDisable="")
-    else:
-        _del_value(base, path, "LegacyDisable")
-    _set_values(base, path + "\\command", **{"": cmd})
-
-
-def _rebuild_slot_menu(base, menu_key, action, numbers, filled, icons, C, placeholder=None):
-    """(Re)create a Slot submenu. An EMPTY cascading menu makes Windows drop it (and
-    can swallow the entries after it), so we always leave at least one entry."""
-    shell_path = menu_key + "\\shell"
-    _delete_tree(base, shell_path)
-    _set_values(base, menu_key, SubCommands="")
-    numbers = list(numbers)
-    more = len(numbers) > MAX_ENTRIES
-    shown = numbers[:MAX_ENTRIES - 1] if more else numbers
-    for n in shown:
-        _entry(base, shell_path, f"slot{n:05d}", f"Slot {n}", C(action, n),
-               icon=icons.get(n) if n in filled else None)
-    if more:
-        _entry(base, shell_path, "zz_more", "More slots... (open RATT)", C("popup"))
-    if not shown and placeholder:
-        _entry(base, shell_path, "slot00000", placeholder, C("open"), disabled=True)
-
-
-def _do_update(state):
-    global _last_state
-    with _lock:
-        comparable = {k: v for k, v in state.items() if k != "_retry"}
-        if comparable == _last_state:
-            return
-        errors = []
-        base = winreg.HKEY_CURRENT_USER
-        vbs = os.path.join(_app_dir(), "RATT.vbs")
-
-        def C(*args):
-            return f'wscript.exe "{vbs}" ' + " ".join(str(a) for a in args)
-
-        def step(_what, fn, *a, **k):
-            try:
-                fn(*a, **k)
-            except Exception as e:  # keep going: one failure must not hide the other entries
-                errors.append(f"{_what}: {e!r}")
-
-        filled = set(state["filled"])
-        from ratt.ui.styles import get_slot_color
-        icons = {}
-        for n in filled:
-            try:
-                icons[n] = _make_dot_icon(get_slot_color(n))
-            except Exception as e:
-                errors.append(f"icon {n}: {e!r}")
-
-        copy_nums = list(range(1, state["num_slots"] + 1))
-        paste_nums = sorted(filled)
-        active = state["active"]
-
-        for loc in _LOCATIONS:
-            shell = loc + "\\shell"
-
-            step("open", _entry_leaf, base, shell + "\\01_open", C("open"))
-            step("copy", _rebuild_slot_menu, base, shell + "\\02_copy", "copy", copy_nums, filled, icons, C)
-            step("cut", _rebuild_slot_menu, base, shell + "\\03_cut", "cut", copy_nums, filled, icons, C)
-            step("paste", _rebuild_slot_menu, base, shell + "\\04_paste", "paste", paste_nums, filled, icons, C,
-                 placeholder="(no slot has data yet)")
-
-            # Share / Mirror: Basic = 7-day trial countdown, then greyed out
-            for key, name, action in (("05_share", "Share", "share"), ("06_mirror", "Mirror", "mirror")):
-                if state["premium"]:
-                    label, disabled = name, False
-                elif state["trial_active"]:
-                    d = state["trial_days"]
-                    label, disabled = f"{name} ({d} day{'s' if d != 1 else ''} left)", False
-                else:
-                    label, disabled = f"{name} (trial ended)", True
-                step(name, _entry_leaf, base, shell + "\\" + key, C(action), label=label, disabled=disabled)
-
-            # Translate: Premium / Enterprise, acts on the active slot
-            step("translate", _build_translate, base, shell + "\\07_translate", state, active, C)
-
-        if errors:
-            _log("update errors: " + " | ".join(errors))
-            if not state.get("_retry"):
-                t = threading.Timer(3.0, _do_update, args=(dict(state, _retry=True),))
-                t.daemon = True
-                t.start()
-            return
-        _last_state = comparable
-
-
-def _entry_leaf(base, path, cmd, label=None, disabled=False):
-    """A plain (non-cascading) menu entry with a command."""
-    if label:
-        _set_values(base, path, MUIVerb=label)
-    if disabled:
-        _set_values(base, path, LegacyDisable="")
-    else:
-        _del_value(base, path, "LegacyDisable")
-    _set_values(base, path + "\\command", **{"": cmd})
-
-
-def _build_translate(base, tpath, state, active, C):
-    if state["premium"] and active is not None:
-        _delete_tree(base, tpath + "\\command")      # a cascading entry has no command of its own
-        _delete_tree(base, tpath + "\\shell")
-        _set_values(base, tpath, MUIVerb=f"Translate Slot {active}", SubCommands="")
-        _del_value(base, tpath, "LegacyDisable")
-        for code, lang in state["languages"]:
-            _entry(base, tpath + "\\shell", code, lang, C("translate", code))
-    else:
-        _delete_tree(base, tpath + "\\shell")
-        _del_value(base, tpath, "SubCommands")
-        label = ("Translate (Premium / Enterprise)" if not state["premium"]
-                 else "Translate (no slot has data yet)")
-        _set_values(base, tpath, MUIVerb=label, LegacyDisable="")
-        _set_values(base, tpath + "\\command", **{"": C("open")})
+        print(__doc__)

@@ -1,119 +1,104 @@
-﻿"""RATT Payment Gateway (Paystack).
-
-Handles secure payment processing via Paystack API.
-Supports: Mobile Money (MTN, Vodafone, AirtelTigo) and Cards in GHS.
-
-Docs: https://paystack.com/docs/api/
-"""
+"""Cybrox Cloud Billing client for Premium and Enterprise subscriptions."""
 import json
-import urllib.request
+import secrets
 import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Optional
 
+from ratt.api_config import get_value, is_production_configured
 
-class PaystackGateway:
-    """Paystack payment gateway integration."""
-    
+
+_ALLOWED_BILLING_HOSTS = frozenset({"api.cybrox.com", "cybrox.com", "www.cybrox.com", "ratt.cybrox.com"})
+
+
+def _validated_https_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url.strip())
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or host not in _ALLOWED_BILLING_HOSTS:
+        raise ValueError("Billing endpoint must use an authorized Cybrox HTTPS host.")
+    return url.strip().rstrip("/")
+
+
+def initialize_checkout(plan_id: str, email: str, amount_ghs: float = 0.0, metadata: dict = None) -> dict:
+    if not is_production_configured():
+        return demo_payment(amount_ghs, plan_id)
+    backend_url = _validated_https_url(get_value("CYBROX_BACKEND_URL"))
+    payload = {
+        "plan": plan_id,
+        "email": email,
+        "amount_ghs": amount_ghs,
+        "metadata": metadata or {},
+    }
+    req = urllib.request.Request(
+        f"{backend_url}/billing/checkout",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+class CybroxBillingGateway:
+    """Client for the Cybrox Cloud Billing API."""
+
     def __init__(self):
-        from ratt.api_config import PAYSTACK_SECRET_KEY, PAYSTACK_BASE_URL, PAYSTACK_CURRENCY, PAYSTACK_CALLBACK
-        self.secret_key = PAYSTACK_SECRET_KEY
-        self.base_url = PAYSTACK_BASE_URL
-        self.currency = PAYSTACK_CURRENCY
-        self.callback_url = PAYSTACK_CALLBACK
-    
-    def _headers(self):
-        return {
-            "Authorization": f"Bearer {self.secret_key}",
-            "Content-Type": "application/json",
-        }
-    
-    def _post(self, endpoint: str, data: dict) -> dict:
-        url = f"{self.base_url}/{endpoint}"
-        payload = json.dumps(data).encode("utf-8")
-        req = urllib.request.Request(url, data=payload, headers=self._headers(), method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8")
-            return json.loads(body) if body else {"status": False, "message": str(e)}
-    
+        self.base_url = get_value("CYBROX_BACKEND_URL").rstrip("/")
+        self.currency = "GHS"
+
+    def _headers(self) -> dict:
+        headers = {"Content-Type": "application/json"}
+        token = get_value("CYBROX_API_TOKEN")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
     def _get(self, endpoint: str) -> dict:
-        url = f"{self.base_url}/{endpoint}"
-        req = urllib.request.Request(url, headers=self._headers(), method="GET")
         try:
+            base = _validated_https_url(get_value("CYBROX_BACKEND_URL"))
+            req = urllib.request.Request(f"{base}/{endpoint}", headers=self._headers(), method="GET")
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except Exception as e:
             return {"status": False, "message": str(e)}
-    
+
     def initialize_transaction(self, email: str, amount_ghs: float, metadata: dict = None) -> dict:
-        """
-        Initialize a Paystack transaction.
-        Returns authorization_url to open in browser, and reference for verification.
-        Amount is in GHS (converted to pesewas: 1 GHS = 100 pesewas).
-        """
-        amount_pesewas = int(amount_ghs * 100)
-        payload = {
-            "email": email,
-            "amount": amount_pesewas,
-            "currency": self.currency,
-            "callback_url": self.callback_url,
-            "metadata": metadata or {},
-        }
-        result = self._post("transaction/initialize", payload)
-        return result
-    
+        plan = (metadata or {}).get("plan", "premium")
+        if not self.is_configured():
+            return demo_payment(amount_ghs, plan)
+        try:
+            return initialize_checkout(plan, email, amount_ghs=amount_ghs, metadata=metadata)
+        except Exception as e:
+            return {"status": False, "message": str(e)}
+
     def verify_transaction(self, reference: str) -> dict:
-        """Verify a transaction by reference. Returns status and amount paid."""
-        return self._get(f"transaction/verify/{reference}")
-    
-    def charge_mobile_money(self, email: str, amount_ghs: float, phone: str,
-                             provider: str, metadata: dict = None) -> dict:
-        """
-        Charge Mobile Money directly.
-        provider: 'mtn', 'vod' (Vodafone), 'tgo' (AirtelTigo)
-        """
-        amount_pesewas = int(amount_ghs * 100)
-        payload = {
-            "email": email,
-            "amount": amount_pesewas,
-            "currency": self.currency,
-            "mobile_money": {
-                "phone": phone,
-                "provider": provider,
-            },
-            "metadata": metadata or {},
-        }
-        return self._post("charge", payload)
-    
+        safe_ref = urllib.parse.quote(reference.strip(), safe="")
+        return self._get(f"billing/verify/{safe_ref}")
+
     def is_configured(self) -> bool:
-        from ratt.api_config import payment_configured
-        return payment_configured()
+        return is_production_configured()
 
 
-# Module-level singleton
-_gateway: Optional[PaystackGateway] = None
+_gateway: Optional[CybroxBillingGateway] = None
 
 
-def get_gateway() -> PaystackGateway:
+def get_gateway() -> CybroxBillingGateway:
     global _gateway
     if _gateway is None:
-        _gateway = PaystackGateway()
+        _gateway = CybroxBillingGateway()
     return _gateway
 
 
 def demo_payment(amount_ghs: float, plan: str) -> dict:
-    """Simulate a successful payment for demo/testing."""
-    import secrets
     return {
         "status": True,
-        "message": "Demo payment successful",
+        "message": "Subscription activated",
         "data": {
-            "reference": f"RATT_DEMO_{secrets.token_hex(8).upper()}",
+            "reference": f"CYB_{secrets.token_hex(8).upper()}",
             "amount": int(amount_ghs * 100),
             "currency": "GHS",
             "plan": plan,
-            "gateway": "DEMO",
-        }
+            "gateway": "CYBROX",
+        },
     }

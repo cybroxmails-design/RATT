@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">RATT v2</string>
+    <string name="ime_name">RATT v2 Slot Keyboard</string>
+    <string name="process_text_title">Copy to RATT Slot</string>
+    <string name="accessibility_service_description">RATT v2 Floating Assist Overlay: Keeps Samsung Keyboard or Gboard active while providing instant 10-slot clipboard injection.</string>
+</resources>

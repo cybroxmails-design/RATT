@@ -1,10 +1,10 @@
-# Contributing to RATT
+﻿# Contributing to RATT
 
 Thank you for your interest in contributing to **RATT (Rapid Access To Text)**! 
 
 ---
 
-## 🧭 Getting Started
+## ðŸ§­ Getting Started
 
 1. **Fork the Repository** on GitHub to your personal account.
 2. **Clone your fork** locally:
@@ -21,7 +21,7 @@ Thank you for your interest in contributing to **RATT (Rapid Access To Text)**!
 
 ---
 
-## 🌿 Branching Strategy
+## ðŸŒ¿ Branching Strategy
 
 * Create feature or bugfix branches off of `main`:
   * `feature/your-feature-name` (for new capabilities or enhancements)
@@ -30,10 +30,10 @@ Thank you for your interest in contributing to **RATT (Rapid Access To Text)**!
 
 ---
 
-## 💻 Development Guidelines
+## ðŸ’» Development Guidelines
 
 * **Code Style**: Follow PEP 8 standards. Use clear docstrings and meaningful type annotations where applicable.
-* **Thread Safety**: Any code interacting with `ClipboardManager` must respect thread locks since hotkey hooks and UI timers operate asynchronously.
+* **Thread Safety**: Any code interacting with `ClipboardManager` must respect thread locks since the helper events, worker threads and UI timers operate asynchronously.
 * **Windows API Safety**:
   * Registry modifications in `context_menu_updater.py` must stay within `HKEY_CURRENT_USER`.
   * Never require Administrator / elevated privileges for standard clipboard features.
@@ -43,7 +43,7 @@ Thank you for your interest in contributing to **RATT (Rapid Access To Text)**!
 
 ---
 
-## 🚀 Submitting a Pull Request (PR)
+## ðŸš€ Submitting a Pull Request (PR)
 
 1. Commit your changes with descriptive commit messages:
    ```bash

@@ -1,0 +1,45 @@
+{
+  "kdf": {
+    "kdf_latency_ms": 6.053925000014715,
+    "kdf_single_core_ops": 165.18209260893872,
+    "kdf_multi_core_ops": 3634.0060373966517,
+    "cpu_cores": 22
+  },
+  "aes": {
+    "1024": {
+      "size_bytes": 1024,
+      "duration_s": 0.01743739999801619,
+      "count": 200,
+      "throughput_mb_s": 22.401562162044826
+    },
+    "65536": {
+      "size_bytes": 65536,
+      "duration_s": 0.22458709999773419,
+      "count": 200,
+      "throughput_mb_s": 111.31538721615009
+    },
+    "1048576": {
+      "size_bytes": 1048576,
+      "duration_s": 0.43491070000163745,
+      "count": 20,
+      "throughput_mb_s": 91.9729038624467
+    },
+    "10485760": {
+      "size_bytes": 10485760,
+      "duration_s": 0.8307904000030248,
+      "count": 4,
+      "throughput_mb_s": 96.29384258617905
+    }
+  },
+  "clipboard": {
+    "dpapi_slot_ops_per_sec": 11978.88840773253,
+    "vault_persistence_ops_per_sec": 1846.4220032679302
+  },
+  "relay": {
+    "post_ops_sec": 20806.246201554844,
+    "get_ops_sec": 422457.14594631665,
+    "bytes_per_envelope": 0.0,
+    "mem_delta_mb": 0.0,
+    "items": 50000
+  }
+}

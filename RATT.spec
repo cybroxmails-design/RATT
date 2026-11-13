@@ -1,15 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-
 block_cipher = None
 
-
 a = Analysis(
-    ['ratt\\main.py'],
-    pathex=[],
+    ['ratt/main.py'],
+    pathex=['.'],
     binaries=[],
     datas=[('assets', 'assets')],
-    hiddenimports=[],
+    hiddenimports=['keyboard'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -41,5 +39,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['assets\\ratt_icon.ico'],
+    icon='assets/ratt_icon.ico',
 )

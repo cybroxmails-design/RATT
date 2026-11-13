@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 400" width="100%" height="100%">
+    <defs>
+        <!-- Background Gradient -->
+        <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#040D1A"/>
+            <stop offset="50%" stop-color="#06152B"/>
+            <stop offset="100%" stop-color="#020812"/>
+        </linearGradient>
+
+        <!-- Primary Cyan-to-Blue Gradient -->
+        <linearGradient id="cyanBlue" x1="0%" y1="0%" x2="100%" y2="80%">
+            <stop offset="0%" stop-color="#26FFFF"/>
+            <stop offset="40%" stop-color="#00D5FE"/>
+            <stop offset="100%" stop-color="#0066FF"/>
+        </linearGradient>
+
+        <!-- Lower Thrust Gradient -->
+        <linearGradient id="blueDeep" x1="0%" y1="10%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#01AEFD"/>
+            <stop offset="60%" stop-color="#0055D4"/>
+            <stop offset="100%" stop-color="#002D80"/>
+        </linearGradient>
+
+        <!-- Dynamic Energy Accent Gradient -->
+        <linearGradient id="orangePulse" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#FFA834"/>
+            <stop offset="50%" stop-color="#FF6A00"/>
+            <stop offset="100%" stop-color="#E63900"/>
+        </linearGradient>
+
+        <!-- Glow Filters -->
+        <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+            <feGaussianBlur stdDeviation="8" result="blur"/>
+            <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+        </filter>
+        <filter id="subtleGlow" x="-10%" y="-10%" width="120%" height="120%">
+            <feGaussianBlur stdDeviation="4" result="blur"/>
+            <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+        </filter>
+    </defs>
+
+    <!-- Background Plate -->
+    <rect width="1200" height="400" rx="24" fill="url(#bgGrad)"/>
+    <rect width="1196" height="396" x="2" y="2" rx="22" fill="none" stroke="#00D5FE" stroke-opacity="0.18" stroke-width="2"/>
+
+    <!-- Left Brand Mark (Centered at X=210, Y=200) -->
+    <g transform="translate(210, 200)">
+        <!-- Outer Precision Hex Frame -->
+        <polygon points="0,-128 110,-64 110,64 0,128 -110,64 -110,-64" 
+                 fill="none" stroke="#00D5FE" stroke-opacity="0.15" stroke-width="2.5" stroke-dasharray="14 8"/>
+
+        <!-- Upper Monogram "C" Wing -->
+        <path d="M 0,-106 
+                 L 82,-58 
+                 L 45,-25 
+                 L -5,-48 
+                 C -40,-48 -60,-28 -60,0 
+                 L -106,0 
+                 C -106,-62 -58,-106 0,-106 Z" 
+              fill="url(#cyanBlue)" filter="url(#subtleGlow)"/>
+
+        <!-- Lower Monogram "C" Wing -->
+        <path d="M -60,0 
+                 C -60,28 -40,48 -5,48 
+                 L 45,25 
+                 L 82,58 
+                 L 0,106 
+                 C -58,106 -106,62 -106,0 Z" 
+              fill="url(#blueDeep)"/>
+
+        <!-- Kinetic Energy Prism -->
+        <polygon points="0,0 52,-30 84,0 32,30" 
+                 fill="url(#orangePulse)" filter="url(#glow)"/>
+
+        <!-- Core Node -->
+        <circle cx="0" cy="0" r="6" fill="#FFFFFF"/>
+        <circle cx="0" cy="0" r="11" fill="none" stroke="#00D5FE" stroke-width="2" stroke-opacity="0.6"/>
+    </g>
+
+    <!-- Brand Typography (Right Side) -->
+    <g transform="translate(410, 218)">
+        <!-- "CYBROX" Wordmark -->
+        <text font-family="'Segoe UI', 'Inter', -apple-system, sans-serif" 
+              font-size="106" 
+              font-weight="900" 
+              letter-spacing="18" 
+              fill="#FFFFFF">
+            CYBROX
+        </text>
+
+        <!-- Subtitle / Mission Tagline -->
+        <text x="6" y="48" 
+              font-family="'Segoe UI', 'Consolas', monospace" 
+              font-size="19" 
+              font-weight="600" 
+              letter-spacing="8" 
+              fill="#00D5FE" 
+              fill-opacity="0.9">
+            SYSTEM UTILITIES &amp; LABS
+        </text>
+
+        <!-- Modern Horizon Accent Line -->
+        <line x1="6" y1="70" x2="520" y2="70" stroke="#00D5FE" stroke-opacity="0.35" stroke-width="2"/>
+        <circle cx="520" cy="70" r="3.5" fill="#FF6A00"/>
+    </g>
+</svg>

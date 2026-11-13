@@ -1,8 +1,7 @@
 """RATT Translation Module.
 
-Provides translation interface for clipboard content.
-Uses Google Cloud Translation when a key is configured (Settings > Configure\nServices), otherwise Google's public web translate endpoint (no key needed).
-Translation is a premium-only feature.
+Translates clipboard slot content across supported languages for Premium and
+Enterprise subscribers.
 """
 from typing import Optional, List, Tuple
 
@@ -94,6 +93,7 @@ class TranslationError(Exception):
 
 # Codes the web endpoint spells differently
 _GTX_CODES = {"zh": "zh-CN", "fil": "tl", "he": "iw"}
+_public_endpoint_consent = False
 
 
 class TranslationManager:
@@ -104,6 +104,24 @@ class TranslationManager:
     @property
     def is_available(self) -> bool:
         return True
+
+    def ensure_consent(self, parent=None) -> bool:
+        """Confirm user consent before sending slot text to the HTTPS translation service."""
+        global _public_endpoint_consent
+        from ratt import api_config
+        key = api_config.get_value("GOOGLE_TRANSLATE_KEY")
+        if key or _public_endpoint_consent:
+            return True
+        from tkinter import messagebox
+        ok = messagebox.askyesno(
+            "Translation Service Consent",
+            "Do you consent to sending the selected slot text over HTTPS to the "
+            "translation service?",
+            parent=parent,
+        )
+        if ok:
+            _public_endpoint_consent = True
+        return bool(ok)
 
     @staticmethod
     def _chunks(text: str):

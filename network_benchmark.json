@@ -1,0 +1,9 @@
+{
+  "throughput": {
+    "tcp_mb_s": 411.77342579737507,
+    "duration": 0.12142599999788217
+  },
+  "handshakes": {
+    "handshakes_per_sec": 2298.8939101418146
+  }
+}

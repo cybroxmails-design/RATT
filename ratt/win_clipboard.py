@@ -1,0 +1,22 @@
+"""Backward-compatible alias module re-exporting from `ratt.hal.win32`."""
+from ratt.hal.win32 import (  # noqa: F401
+    CF_DIB,
+    CF_DIBV5,
+    CF_HDROP,
+    CF_HTML,
+    CF_MIME_PNG,
+    CF_MIME_SVG,
+    CF_PNG,
+    CF_PREFERREDDROPEFFECT,
+    CF_SVG,
+    CF_UNICODETEXT,
+    DROPEFFECT_COPY,
+    DROPEFFECT_MOVE,
+    Win32Platform,
+    _ClipboardLock,
+    _user32,
+    build_hdrop_bytes,
+    get_sequence_number,
+    read_clipboard_bundle,
+    write_clipboard_bundle,
+)

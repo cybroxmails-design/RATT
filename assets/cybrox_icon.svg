@@ -1,0 +1,103 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%">
+    <defs>
+        <!-- Deep Obsidian Space Background -->
+        <linearGradient id="iconBg" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#05101E"/>
+            <stop offset="45%" stop-color="#081A32"/>
+            <stop offset="100%" stop-color="#020710"/>
+        </linearGradient>
+
+        <!-- Upper Wing Gradient (Electric Cyan to Royal Blue) -->
+        <linearGradient id="cTopWing" x1="0%" y1="0%" x2="100%" y2="80%">
+            <stop offset="0%" stop-color="#26FFFF"/>
+            <stop offset="35%" stop-color="#00D5FE"/>
+            <stop offset="100%" stop-color="#0066FF"/>
+        </linearGradient>
+
+        <!-- Lower Wing Gradient (Velocity Blue to Deep Navy) -->
+        <linearGradient id="cBottomWing" x1="0%" y1="10%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#01AEFD"/>
+            <stop offset="55%" stop-color="#0055D4"/>
+            <stop offset="100%" stop-color="#002D80"/>
+        </linearGradient>
+
+        <!-- Kinetic Energy Core (Electric Neon Amber / Orange) -->
+        <linearGradient id="coreSpark" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#FFA834"/>
+            <stop offset="50%" stop-color="#FF6A00"/>
+            <stop offset="100%" stop-color="#E63900"/>
+        </linearGradient>
+
+        <!-- Radial Ambient Glow behind the Emblem -->
+        <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%">
+            <stop offset="0%" stop-color="#00D5FE" stop-opacity="0.22"/>
+            <stop offset="60%" stop-color="#00D5FE" stop-opacity="0.05"/>
+            <stop offset="100%" stop-color="#00D5FE" stop-opacity="0"/>
+        </radialGradient>
+
+        <!-- Precision Glow Filters -->
+        <filter id="intenseGlow" x="-30%" y="-30%" width="160%" height="160%">
+            <feGaussianBlur stdDeviation="8" result="blur1"/>
+            <feGaussianBlur stdDeviation="16" result="blur2"/>
+            <feMerge>
+                <feMergeNode in="blur2"/>
+                <feMergeNode in="blur1"/>
+                <feMergeNode in="SourceGraphic"/>
+            </feMerge>
+        </filter>
+        
+        <filter id="subtleGlow" x="-20%" y="-20%" width="140%" height="140%">
+            <feGaussianBlur stdDeviation="4" result="blur"/>
+            <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+        </filter>
+    </defs>
+
+    <!-- App Icon Base: Premium Squircle -->
+    <rect width="512" height="512" rx="116" fill="url(#iconBg)"/>
+    <rect width="506" height="506" x="3" y="3" rx="113" fill="none" stroke="#00D5FE" stroke-opacity="0.28" stroke-width="2.5"/>
+
+    <!-- Subtle Ambient Radial Glow -->
+    <circle cx="256" cy="256" r="190" fill="url(#centerGlow)"/>
+
+    <!-- Master Icon Artwork (Centered at 256, 256) -->
+    <g transform="translate(256, 256)">
+        <!-- Outer Precision Hexagonal Frame -->
+        <polygon points="0,-165 142,-83 142,83 0,165 -142,83 -142,-83" 
+                 fill="none" stroke="#00D5FE" stroke-opacity="0.14" stroke-width="3" stroke-dasharray="18 10"/>
+        
+        <!-- Hexagon Corner Accent Marks -->
+        <circle cx="0" cy="-165" r="3" fill="#00D5FE" fill-opacity="0.5"/>
+        <circle cx="142" cy="-83" r="3" fill="#00D5FE" fill-opacity="0.5"/>
+        <circle cx="142" cy="83" r="3" fill="#00D5FE" fill-opacity="0.5"/>
+        <circle cx="0" cy="165" r="3" fill="#00D5FE" fill-opacity="0.5"/>
+        <circle cx="-142" cy="83" r="3" fill="#00D5FE" fill-opacity="0.5"/>
+        <circle cx="-142" cy="-83" r="3" fill="#00D5FE" fill-opacity="0.5"/>
+
+        <!-- Upper Monogram "C" Wing (High-Velocity Aerodynamic Blade) -->
+        <path d="M 0,-136 
+                 L 106,-74 
+                 L 58,-32 
+                 L -6,-62 
+                 C -52,-62 -78,-36 -78,0 
+                 L -136,0 
+                 C -136,-80 -76,-136 0,-136 Z" 
+              fill="url(#cTopWing)" filter="url(#subtleGlow)"/>
+
+        <!-- Lower Monogram "C" Wing (Architectural Bedrock Anchor) -->
+        <path d="M -78,0 
+                 C -78,36 -52,62 -6,62 
+                 L 58,32 
+                 L 106,74 
+                 L 0,136 
+                 C -76,136 -136,80 -136,0 Z" 
+              fill="url(#cBottomWing)"/>
+
+        <!-- Kinetic Energy Prism (Forward Acceleration Apex) -->
+        <polygon points="0,0 66,-38 106,0 40,38" 
+                 fill="url(#coreSpark)" filter="url(#intenseGlow)"/>
+
+        <!-- Core Synapse Point -->
+        <circle cx="0" cy="0" r="8" fill="#FFFFFF"/>
+        <circle cx="0" cy="0" r="14" fill="none" stroke="#00D5FE" stroke-width="2.5" stroke-opacity="0.6"/>
+    </g>
+</svg>

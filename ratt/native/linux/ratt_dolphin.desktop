@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=KonqPopupMenu/Plugin
+MimeType=all/all;
+Actions=RattCopySlot1;RattCopySlot2;RattPasteSlot1;RattPasteSlot2;
+X-KDE-Submenu=RATT v2
+
+[Desktop Action RattCopySlot1]
+Name=Copy to Slot 1
+Exec=python3 -m ratt.main copy 1 %F
+
+[Desktop Action RattCopySlot2]
+Name=Copy to Slot 2
+Exec=python3 -m ratt.main copy 2 %F
+
+[Desktop Action RattPasteSlot1]
+Name=Paste from Slot 1
+Exec=python3 -m ratt.main paste 1 %f
+
+[Desktop Action RattPasteSlot2]
+Name=Paste from Slot 2
+Exec=python3 -m ratt.main paste 2 %f

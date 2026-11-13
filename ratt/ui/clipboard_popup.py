@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from ratt.app import RattApp
 
 from ratt.ui.styles import *
-from ratt.config import config, TRANSLATE_LANGUAGES, UserTier
+from ratt.config import config, TRANSLATE_LANGUAGES
 
 # Menu colors (no borders)
 _BG = "#0D2137"
@@ -58,7 +58,7 @@ class ClipboardPopup:
         # Header
         hdr = tk.Frame(main, bg=_HEAD, padx=12, pady=8)
         hdr.pack(fill=tk.X)
-        tk.Label(hdr, text="RATT", font=(FONT_FAMILY, 13, "bold"),
+        tk.Label(hdr, text=f"{config.APP_NAME} v{config.VERSION}", font=(FONT_FAMILY, 13, "bold"),
                  fg="#00BFFF", bg=_HEAD).pack(side=tk.LEFT)
         tier = config.user.tier.value.title()
         tc = {"basic": "#888", "premium": "#4CAF50", "enterprise": "#CE93D8"}
@@ -132,6 +132,26 @@ class ClipboardPopup:
               hover=lambda e: self._show_translate_sub() if can_translate else None,
               icon="#4CAF50")
 
+        _sep(main)
+
+        # Android Keyboard (IME) — Premium + Enterprise only; clicking as Basic prompts upgrade
+        can_android = config.is_premium
+        _item(main, "Android Keyboard (IME)",
+              None if can_android else self._on_android_upgrade,
+              arrow=can_android, enabled=True,
+              subtitle="" if can_android else "(Premium / Enterprise)",
+              hover=lambda e: self._show_android_sub() if can_android else None,
+              icon="#A4C639")
+
+        # iOS Keyboard (iPhone) — Premium + Enterprise only; clicking as Basic prompts upgrade
+        can_ios = config.is_premium
+        _item(main, "iOS Keyboard (iPhone)",
+              None if can_ios else self._on_ios_upgrade,
+              arrow=can_ios, enabled=True,
+              subtitle="" if can_ios else "(Premium / Enterprise)",
+              hover=lambda e: self._show_ios_sub() if can_ios else None,
+              icon="#00BFFF")
+
         # Position
         self.popup.update_idletasks()
         pw, ph = self.popup.winfo_reqwidth(), self.popup.winfo_reqheight()
@@ -142,6 +162,43 @@ class ClipboardPopup:
         self.popup.bind("<Escape>", lambda e: self.dismiss())
         self.popup.bind("<FocusOut>", self._focus_out)
         self.popup.focus_set()
+
+    def show_translate_picker(self, code):
+        """Small menu at the cursor: which slot should be translated into this language?"""
+        self.dismiss()
+        if not config.user.is_logged_in:
+            self._show_signup_required()
+            return
+        if not config.is_premium:
+            self.app.show_main_window()
+            self.app.show_notification("Translate is for Premium and Enterprise users", is_error=True)
+            return
+        filled = self.app.clipboard_manager.get_all_slots()
+        if not filled:
+            self.app.show_notification("No slot has data yet - copy something to a slot first", is_error=True)
+            return
+        name = dict(TRANSLATE_LANGUAGES).get(code, code)
+        x, y = self.root.winfo_pointerx(), self.root.winfo_pointery()
+        self.popup = tk.Toplevel(self.root)
+        self.popup.overrideredirect(True)
+        self.popup.attributes("-topmost", True)
+        self.popup.configure(bg=_BG)
+        main = tk.Frame(self.popup, bg=_BG)
+        main.pack(fill=tk.BOTH, expand=True)
+        tk.Label(main, text=f"Translate to {name} - from which slot?", font=FONT_SMALL,
+                 fg="#5599BB", bg=_HEAD, padx=12, pady=8).pack(fill=tk.X)
+        _sep(main)
+        for num in sorted(filled.keys()):
+            self._slot_row(main, num, get_slot_color(num), "translate:" + code,
+                           preview=filled[num].preview)
+        self.popup.update_idletasks()
+        pw, ph = self.popup.winfo_reqwidth(), self.popup.winfo_reqheight()
+        sw, sh = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        self.popup.geometry(f"+{min(x, sw - pw)}+{min(y, sh - ph)}")
+        self.popup.bind("<Escape>", lambda e: self.dismiss())
+        self.popup.bind("<FocusOut>", self._focus_out)
+        self.popup.focus_force()
+        self.popup.after(20000, self.dismiss)      # never leave it hanging around
 
     def _show_signup_required(self):
         """Show message that signup is required."""
@@ -190,12 +247,16 @@ class ClipboardPopup:
             tk.Label(inner, text=title, font=FONT_SMALL,
                      fg="#5599BB", bg=_BG, padx=10, pady=4).pack(anchor=tk.W)
             _sep(inner)
-            for i in range(1, config.max_slots + 1):
+            max_popup_slots = min(config.max_slots, 25)
+            for i in range(1, max_popup_slots + 1):
                 color = get_slot_color(i)
                 slot = self.app.clipboard_manager.get_slot(i)
                 has = slot and not slot.is_empty
                 self._slot_row(inner, i, color, action,
                                preview=slot.preview if has else None)
+            if config.max_slots > max_popup_slots:
+                tk.Label(inner, text=f"+ Slots {max_popup_slots + 1}..{config.max_slots:,} via Ctrl+C/X + number",
+                         font=FONT_SMALL, fg="#556677", bg=_BG, padx=10, pady=4).pack(anchor=tk.W)
         self._open_sub(build)
 
     def _show_paste_sub(self):
@@ -275,24 +336,46 @@ class ClipboardPopup:
 
     def _on_slot(self, action, num):
         self.dismiss()
-        if action == "copy":
-            if self.app.clipboard_manager.copy_to_slot(num):
-                self.app.show_notification(f"Copied to Slot #{num}")
-                self.app._refresh_slots()
+        if action.startswith("translate:"):
+            self.app.actions.translate(action.split(":", 1)[1], num, delay=0.35)
+        elif action == "copy":
+            self.app.copy_to_slot(num)
         elif action == "cut":
-            if self.app.clipboard_manager.cut_to_slot(num):
-                self.app.show_notification(f"Cut to Slot #{num}")
-                self.app._refresh_slots()
+            self.app.cut_to_slot(num)
         elif action == "paste":
-            result = self.app.clipboard_manager.paste_from_slot(num)
-            if result:
-                self.app.show_notification(f"Pasted from Slot #{num}")
-                try:
-                    import keyboard, time
-                    time.sleep(0.1)
-                    keyboard.send('ctrl+v')
-                except Exception:
-                    pass
+            self.app.actions.run("paste", [str(num)])
+        elif action in ("android-copy", "android-cut", "android-paste", "ios-copy", "ios-cut", "ios-paste"):
+            self.app.actions.run(action, [str(num)])
+
+    def _on_android_upgrade(self):
+        from ratt.clipboard_manager import UPGRADE_ANDROID_MSG
+        self.dismiss()
+        self.app.request_upgrade(UPGRADE_ANDROID_MSG.split("UPGRADE_REQUIRED:", 1)[1].strip())
+
+    def _on_ios_upgrade(self):
+        from ratt.clipboard_manager import UPGRADE_IOS_MSG
+        self.dismiss()
+        self.app.request_upgrade(UPGRADE_IOS_MSG.split("UPGRADE_REQUIRED:", 1)[1].strip())
+
+    def _show_android_sub(self):
+        def build(inner):
+            tk.Label(inner, text="Android Keyboard (IME)", font=FONT_SMALL,
+                     fg="#A4C639", bg=_BG, padx=10, pady=4).pack(anchor=tk.W)
+            _sep(inner)
+            _item(inner, "Copy Slot #1 to Android", lambda: self._on_slot("android-copy", 1), icon="#A4C639")
+            _item(inner, "Cut Slot #1 to Android", lambda: self._on_slot("android-cut", 1), icon="#A4C639")
+            _item(inner, "Paste from Android to Slot #1", lambda: self._on_slot("android-paste", 1), icon="#A4C639")
+        self._open_sub(build)
+
+    def _show_ios_sub(self):
+        def build(inner):
+            tk.Label(inner, text="iOS Keyboard (iPhone)", font=FONT_SMALL,
+                     fg="#00BFFF", bg=_BG, padx=10, pady=4).pack(anchor=tk.W)
+            _sep(inner)
+            _item(inner, "Copy Slot #1 to iPhone (iOS)", lambda: self._on_slot("ios-copy", 1), icon="#00BFFF")
+            _item(inner, "Cut Slot #1 to iPhone (iOS)", lambda: self._on_slot("ios-cut", 1), icon="#00BFFF")
+            _item(inner, "Paste from iPhone (iOS) to Slot #1", lambda: self._on_slot("ios-paste", 1), icon="#00BFFF")
+        self._open_sub(build)
 
     def _on_share(self):
         if not config.user.is_trial_active:
@@ -321,9 +404,19 @@ class ClipboardPopup:
         self.app.show_notification(f"{action.title()} with {contact.display_name}...")
 
     def _on_translate(self, code, name):
-        self.dismiss()
-        # translate the active slot and paste the result into the document
-        self.app.translate_active_slot(code, delay=0.35)
+        """Language chosen -> ask which slot to translate (Translate > Language > Slot)."""
+        def build(inner):
+            tk.Label(inner, text=f"Translate to {name} - from slot...", font=FONT_SMALL,
+                     fg="#5599BB", bg=_BG, padx=10, pady=4).pack(anchor=tk.W)
+            _sep(inner)
+            filled = self.app.clipboard_manager.get_all_slots()
+            if not filled:
+                tk.Label(inner, text="No slot has data yet", font=FONT_SMALL,
+                         fg="#555", bg=_BG, padx=10, pady=6).pack()
+            for num in sorted(filled.keys()):
+                self._slot_row(inner, num, get_slot_color(num), "translate:" + code,
+                               preview=filled[num].preview)
+        self._open_sub(build)
 
     def dismiss(self):
         if self.submenu and self.submenu.winfo_exists():

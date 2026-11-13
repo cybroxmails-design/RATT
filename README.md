@@ -1,77 +1,69 @@
-# RATT — Rapid Access To Text
+# RATT v2 — Rapid Access To Text
 
-[![Publisher](https://img.shields.io/badge/Publisher-Cybrox.Inc-blue.svg)](https://github.com/)
-[![Platform](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com)
+[![Publisher](https://img.shields.io/badge/Publisher-Cybrox-blue.svg)](https://github.com/)
+[![Version](https://img.shields.io/badge/Version-v2.0.0-00BFFF.svg)](https://github.com/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20Android-0078D6.svg)](https://microsoft.com)
 [![Python Version](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](https://python.org)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**RATT** (*Rapid Access To Text*) is a high-performance multi-slot clipboard manager and workflow acceleration utility for Windows. Developed by **Cybrox.Inc**, RATT replaces the limitation of standard single-item clipboards with multi-slot memory buffers, sequential global keyboard chording, dynamic Windows Explorer context menu integration, inline translation, and real-time screen sharing/mirroring.
+**RATT v2** (*Rapid Access To Text*) is an enterprise multi-slot clipboard manager, workflow accelerator, and secure file/media routing platform developed by **Cybrox**. RATT replaces the standard single-item clipboard with numbered slots, instant keyboard chords, cascading shell context menus, vector/raster media preservation, non-execution security filters, and cross-platform architecture.
 
 ---
 
 ## 🚀 Key Features
 
-* **Multi-Slot Clipboard Engine**: Manage from 2 up to 50,000 text slots with instant visual feedback and sub-10ms response times.
-* **Global Keyboard Chording**: Perform actions without leaving your active app:
-  * `Ctrl + C`, then type slot number &rarr; *Copy to Slot*
-  * `Ctrl + X`, then type slot number &rarr; *Cut to Slot*
-  * `Ctrl + V`, then type slot number &rarr; *Paste from Slot*
-  * `Ctrl + Shift + R` &rarr; *Quick HUD Popup*
-* **Dynamic Windows Shell Menu**: Cascading right-click menu in Windows Explorer dynamically reflects which slots hold data with colored dot indicators.
-* **Zero Cold-Storage Privacy**: Clipboard buffers live strictly in system RAM protected by ephemeral AES-256 Fernet session keys that are purged on exit.
-* **Translation Engine**: Translate copied text to 50+ languages using Google Cloud / Web endpoints.
-* **Peer-to-Peer Mirror & Share**: Share clipboard contents or mirror text directly to a colleague's screen.
-* **Tiered Commercial Engine**: Basic (Free), Premium, and Enterprise plans with integrated Paystack payment processing (Mobile Money & Card).
+* **Multi-Slot Clipboard**: from 10 up to 50,000 text slots, each with its own colour.
+* **Keyboard chords** that work in any app:
+  * `Ctrl + C`, then the slot number &rarr; *Copy to Slot*
+  * `Ctrl + X`, then the slot number &rarr; *Cut to Slot*
+  * `Ctrl + V`, then the slot number &rarr; *Paste from Slot* (Ctrl+V waits 1 second for the number, then pastes normally)
+  * `Ctrl + Shift + R` &rarr; *Quick popup*
+* **Right-click menu**: one `RATT` entry with Copy / Cut / Paste per slot, Share, Mirror and Translate → Language → Slot. Slots that hold data show a dot in their colour.
+* **Translation**: translate a slot to another language and paste the result into your document (Premium / Enterprise).
+* **Share & Mirror**: send clipboard content or mirror it to a colleague (Basic: 7-day trial).
+* **Plans**: Basic (free), Premium (USD 0.99 per 10 slots / month) and Enterprise (USD 2.99 / month) with Paystack payments (Mobile Money & card).
 
 ---
 
-## 🛠️ Architecture & Documentation
+## 🧩 How it is built (hybrid)
 
-* Detailed Architecture Plan: See [`RATT_Architecture_Plan.pdf`](RATT_Architecture_Plan.pdf) for layered diagrams, sequence flows, IPC models, and security breakdowns.
+| Part | Language | Job |
+|------|----------|-----|
+| `ratt/` application | Python / Tkinter | windows, slots, accounts, payments, translation |
+| `daemon/ratt_daemon.c` → `assets/ratt_daemon.dll` | C (run by `rundll32.exe`) | global hotkeys (`RegisterHotKey`, no keyboard hook), key injection, instant delivery of right-click actions |
+| `shellext/ratt_menu.c` → `assets/ratt_menu.dll` | C | the Explorer right-click menu (a registry menu is capped at 16 entries by Windows) |
+
+The Python app and the helper talk through a hidden window (`WM_COPYDATA`, app → helper) and a per-user named pipe (helper → app). See the comment at the top of `daemon/ratt_daemon.c` for the protocol, and [`RATT_Architecture_Plan.pdf`](RATT_Architecture_Plan.pdf) for diagrams.
+
+> The two DLLs are unsigned. Windows Application Control / Smart App Control may refuse to load an unsigned DLL for a while (or for good). RATT retries automatically and tells you; sign the DLLs before distributing RATT.
 
 ---
 
-## 💻 Developer Setup & Contributing
+## 💻 Developer Setup
 
 ### Prerequisites
-* Windows 10 or 11 (64-bit)
-* Python 3.10 or higher
-* Git (or GitHub Desktop)
+* Windows 10 or 11 (64-bit), Python 3.10+
+* MinGW-w64 `gcc` (for example from MSYS2) to build the two DLLs
 
-### Step 1: Clone the Repository
-```powershell
-git clone https://github.com/<your-username>/RATT.git
-cd RATT
-```
-
-### Step 2: Create a Virtual Environment
+### Run from source
 ```powershell
 python -m venv venv
 .\venv\Scripts\activate
-```
-
-### Step 3: Install Dependencies
-```powershell
 pip install -r requirements.txt
-```
-
-### Step 4: Run the Application Locally
-```powershell
+python build_native.py        # builds assets\ratt_daemon.dll and assets\ratt_menu.dll
 python -m ratt.main
 ```
 
-### Step 5: (Optional) Register Windows Context Menu
-To enable the cascading right-click menu in Windows Explorer:
-```powershell
-python -m ratt.register_context_menu
-```
-
-### Step 6: Build Standalone Executable
-To package the app into a standalone `.exe` using PyInstaller:
+### Build the standalone executable
 ```powershell
 .\build.bat
 ```
-The compiled binary will be placed in `dist/RATT.exe`.
+The binary is written to `dist/RATT.exe`.
+
+### Remove the right-click menu
+```powershell
+python -m ratt.context_menu_updater --unregister
+```
 
 ---
 
@@ -79,33 +71,34 @@ The compiled binary will be placed in `dist/RATT.exe`.
 
 ```
 RATT/
-├── assets/                  # Icons, graphics, dynamic dot indicators
-├── ratt/                    # Main application package
-│   ├── ui/                  # Tkinter UI pages, HUD popup, styles
-│   ├── app.py               # Central coordinator (RattApp)
-│   ├── clipboard_manager.py # Thread-safe multi-slot buffer
-│   ├── config.py            # User tiers, preferences, sessions
-│   ├── context_menu_updater.py # Registry sync daemon
-│   ├── encryption.py        # Ephemeral AES-256 crypto layer
-│   ├── hotkey_listener.py   # Global keyboard chord state machine
-│   ├── main.py              # Entry point & loopback socket IPC
-│   ├── payment_gateway.py   # Paystack checkout integration
-│   ├── register_context_menu.py # Windows registry setup
-│   ├── sync.py              # Cross-device synchronization stub
-│   ├── translation.py       # Cloud translation integration
-│   └── tray_icon.py         # System tray daemon (pystray)
-├── build.bat                # PyInstaller packaging script
-├── generate_icon.py         # Asset generator script
-├── requirements.txt         # Python package dependencies
+├── assets/                  # icons, logo, the two native DLLs
+├── daemon/ratt_daemon.c     # helper: hotkeys, key injection, action relay
+├── shellext/ratt_menu.c     # right-click menu shell extension
+├── ratt/
+│   ├── ui/                  # Tkinter pages, popup, styles
+│   ├── actions.py           # what menu / popup / hotkey actions do
+│   ├── app.py               # main window and coordinator (RattApp)
+│   ├── clipboard_manager.py # thread-safe multi-slot buffer
+│   ├── config.py            # plans, prices, preferences, session
+│   ├── context_menu_updater.py # installs the menu extension, describes the menu
+│   ├── daemon_link.py       # starts the helper, talks to it
+│   ├── instance.py          # one RATT at a time
+│   ├── main.py              # entry point
+│   ├── native.py            # data folder, installing / loading the DLLs
+│   ├── payment_gateway.py   # Paystack checkout
+│   ├── translation.py       # translation
+│   └── tray_icon.py         # system tray icon (pystray)
+├── build.bat                # build everything
+├── build_native.py          # compile the DLLs with gcc
 ├── RATT.spec                # PyInstaller specification
-└── RATT.vbs                 # Silent background shell runner
+└── RATT.vbs                 # silent launcher for running from source
 ```
 
 ---
 
 ## 🤝 Contributing
 
-Contributions from the developer community are welcome! Please check out [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct, branching conventions, and pull request procedures.
+Contributions are welcome! See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

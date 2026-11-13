@@ -5,7 +5,7 @@ The mirrored text appears in a read-only transparent overlay.
 """
 import tkinter as tk
 from tkinter import messagebox
-import random
+import secrets
 from typing import Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -124,8 +124,8 @@ class MirrorDialog:
         self.status_label.pack(pady=(8, 0))
     
     def _generate_code(self) -> str:
-        """Generate a random 4-digit code."""
-        return ''.join(random.choices('0123456789', k=4))
+        """Generate a cryptographically random 6-digit code."""
+        return ''.join(secrets.choice('0123456789') for _ in range(6))
     
     def _on_connect(self):
         """Handle connect button."""
@@ -138,6 +138,7 @@ class MirrorDialog:
                 return
             
             self._verification_code = self._generate_code()
+            self.app._active_mirror_code = self._verification_code
             
             for w in self.code_frame.winfo_children():
                 w.destroy()
@@ -168,14 +169,14 @@ class MirrorDialog:
                 w.destroy()
             
             tk.Label(
-                self.code_frame, text="Enter the 4-digit code:", font=FONT_BODY,
+                self.code_frame, text="Enter the mirror code:", font=FONT_BODY,
                 fg=TEXT_PRIMARY, bg=BG_PRIMARY
             ).pack(anchor=tk.W, pady=(0, 4))
             
             self.code_entry = tk.Entry(
                 self.code_frame, font=(FONT_FAMILY, 24, "bold"),
                 bg=BG_SECONDARY, fg=TEXT_PRIMARY, insertbackground=TEXT_PRIMARY,
-                relief=tk.FLAT, justify=tk.CENTER, width=6,
+                relief=tk.FLAT, justify=tk.CENTER, width=8,
                 highlightbackground=BORDER, highlightthickness=1
             )
             self.code_entry.pack(ipady=4)
@@ -186,8 +187,17 @@ class MirrorDialog:
     def _on_guest_accept(self):
         """Handle guest accepting mirror connection."""
         code = self.code_entry.get().strip()
-        if len(code) != 4 or not code.isdigit():
-            messagebox.showwarning("Invalid Code", "Please enter a valid 4-digit code.", parent=self.dialog)
+        if not code or not code.isdigit() or len(code) not in (4, 6):
+            messagebox.showwarning("Invalid Code", "Please enter a valid numeric mirror code.", parent=self.dialog)
+            return
+        expected = getattr(self.app, "_active_mirror_code", "")
+        if not expected or not secrets.compare_digest(code, expected):
+            messagebox.showerror(
+                "Invalid Mirror Code",
+                "The mirror code was not recognized or has expired.\n"
+                "(Generate a host code first, or click 'Demo Mirror Overlay' to preview.)",
+                parent=self.dialog
+            )
             return
         
         self.status_label.config(text="Connected! Mirror overlay active.", fg=SUCCESS)
@@ -251,7 +261,7 @@ class MirrorDialog:
         
         # Footer
         footer = tk.Label(
-            self.mirror_overlay, text="🔒 End-to-end encrypted  •  Read-only access  •  Cannot copy or modify",
+            self.mirror_overlay, text="🔒 Volatile memory only  •  Read-only access  •  Cannot copy or modify",
             font=FONT_SMALL, fg=TEXT_MUTED, bg="#1a1a2e", pady=6
         )
         footer.pack(fill=tk.X)
