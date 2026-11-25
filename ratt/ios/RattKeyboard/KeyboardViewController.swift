@@ -49,6 +49,7 @@ public final class KeyboardViewController: UIInputViewController {
 
     public override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        _ = AppGroupDataManager.shared.importSlotsFromPasteboardCarrier()
         refreshSlotStates()
     }
 

@@ -54,32 +54,45 @@ class MainActivity : Activity() {
 
         fun sendToPc(context: Context, slotId: Int, content: String) {
             val prefs = context.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
-            val pcIp = prefs.getString("paired_pc_ip", null) ?: return
+            val pcIp = prefs.getString("paired_pc_ip", null)
+            val iosIp = prefs.getString("last_ios_ip", null)
+            val token = SlotRepository.getOrCreateSyncToken(context)
             thread(isDaemon = true) {
-                try {
-                    val url = URL("http://$pcIp:49210/sync_from_phone")
-                    val conn = url.openConnection() as HttpURLConnection
-                    conn.requestMethod = "POST"
-                    conn.doOutput = true
-                    conn.connectTimeout = 2000
-                    conn.readTimeout = 2000
-                    conn.setRequestProperty("Content-Type", "application/json")
-                    conn.setRequestProperty("X-RATT-Token", SlotRepository.getOrCreateSyncToken(context))
-                    val json = JSONObject().apply {
-                        if (content.isEmpty()) {
-                            put("action", "CLEAR_SLOT")
-                        } else {
-                            put("action", "SYNC_FROM_PHONE")
+                val targets = mutableListOf<Pair<String, Int>>()
+                if (!pcIp.isNullOrEmpty() && pcIp != "Not Paired Yet") {
+                    targets.add(Pair(pcIp, 49210))
+                }
+                if (!iosIp.isNullOrEmpty() && iosIp != pcIp) {
+                    targets.add(Pair(iosIp, 49211))
+                }
+                for ((host, port) in targets) {
+                    try {
+                        val url = URL("http://$host:$port/sync_from_phone")
+                        val conn = url.openConnection() as HttpURLConnection
+                        conn.requestMethod = "POST"
+                        conn.doOutput = true
+                        conn.connectTimeout = 2000
+                        conn.readTimeout = 2000
+                        conn.setRequestProperty("Content-Type", "application/json")
+                        conn.setRequestProperty("X-RATT-Token", token)
+                        val json = JSONObject().apply {
+                            if (content.isEmpty()) {
+                                put("action", "CLEAR_SLOT")
+                            } else {
+                                put("action", "SYNC_FROM_ANDROID")
+                            }
+                            put("slot_id", slotId)
+                            put("content", content)
+                            put("timestamp", System.currentTimeMillis() / 1000.0)
+                            put("nonce", java.util.UUID.randomUUID().toString())
                         }
-                        put("slot_id", slotId)
-                        put("content", content)
-                    }
-                    val out = conn.outputStream
-                    out.write(json.toString().toByteArray(Charsets.UTF_8))
-                    out.flush()
-                    out.close()
-                    conn.responseCode
-                } catch (_: Exception) {}
+                        val out = conn.outputStream
+                        out.write(json.toString().toByteArray(Charsets.UTF_8))
+                        out.flush()
+                        out.close()
+                        conn.responseCode
+                    } catch (_: Exception) {}
+                }
             }
         }
 
@@ -1185,23 +1198,11 @@ class MainActivity : Activity() {
     }
 
     fun handleCrossPlatformSync(targetPlatform: String) {
-        if (!UserTierManager.canSyncWithApple(this)) {
-            AlertDialog.Builder(this)
-                .setTitle("⭐ Upgrade to Premium or Enterprise")
-                .setMessage("Android to Windows PC sync is 100% Free!\n\nCross-platform sync from Android to macOS and iOS is limited to Premium and Enterprise subscribers.\n\nPlease upgrade your plan to unlock instant syncing with $targetPlatform!")
-                .setPositiveButton("Upgrade Now") { _, _ ->
-                    showTierUpgradeDialog()
-                }
-                .setNegativeButton("Cancel", null)
-                .show()
-            return
-        }
-
         val prefs = getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
         val lastTargetIp = prefs.getString("last_${targetPlatform.lowercase()}_ip", "") ?: ""
 
         val input = EditText(this).apply {
-            hint = "e.g. <target-device-ip>"
+            hint = "e.g. 10.191.126.x (IP shown on $targetPlatform)"
             textSize = 15f
             setTextColor(Color.parseColor("#39FF14"))
             typeface = Typeface.MONOSPACE
@@ -1217,8 +1218,8 @@ class MainActivity : Activity() {
         }
 
         AlertDialog.Builder(this)
-            .setTitle("Sync Android Slots with $targetPlatform")
-            .setMessage("Enter the IP address of your $targetPlatform device running RATT:")
+            .setTitle("🔄 Two-Way Sync with $targetPlatform")
+            .setMessage("Enter the green IP address shown on your $targetPlatform RATT screen:")
             .setView(container)
             .setPositiveButton("Sync Now") { _, _ ->
                 val targetIp = input.text.toString().trim()
@@ -1232,9 +1233,13 @@ class MainActivity : Activity() {
     }
 
     private fun performCrossSyncToTarget(targetIp: String, platformName: String) {
+        val token = SlotRepository.getOrCreateSyncToken(this@MainActivity)
         thread(isDaemon = true) {
-            var sent = 0
+            var pushed = 0
+            var pulled = 0
             val ports = if (platformName == "iOS") listOf(49211, 49210) else listOf(49211, 49210)
+
+            // 1. Push all filled Android slots to iOS / macOS
             for (slotId in 1..10) {
                 val content = SlotRepository.getSlotContent(slotId)
                 if (content.isNotEmpty()) {
@@ -1244,51 +1249,65 @@ class MainActivity : Activity() {
                             val conn = url.openConnection() as HttpURLConnection
                             conn.requestMethod = "POST"
                             conn.doOutput = true
-                            conn.connectTimeout = 1500
-                            conn.readTimeout = 1500
+                            conn.connectTimeout = 2000
+                            conn.readTimeout = 2000
                             conn.setRequestProperty("Content-Type", "application/json")
+                            conn.setRequestProperty("X-RATT-Token", token)
                             val json = JSONObject().apply {
                                 put("action", "SYNC_FROM_ANDROID")
                                 put("slot_id", slotId)
                                 put("content", content)
-                                put("tier", UserTierManager.getTier(this@MainActivity))
+                                put("timestamp", System.currentTimeMillis() / 1000.0)
+                                put("nonce", java.util.UUID.randomUUID().toString())
                             }
                             val out = conn.outputStream
                             out.write(json.toString().toByteArray(Charsets.UTF_8))
                             out.flush()
                             out.close()
                             if (conn.responseCode in 200..299) {
-                                sent++
+                                pushed++
                                 break
                             }
                         } catch (_: Exception) {}
                     }
-                } else {
-                    for (port in ports) {
-                        try {
-                            val url = URL("http://$targetIp:$port/sync_slot")
-                            val conn = url.openConnection() as HttpURLConnection
-                            conn.requestMethod = "POST"
-                            conn.doOutput = true
-                            conn.connectTimeout = 1200
-                            conn.readTimeout = 1200
-                            conn.setRequestProperty("Content-Type", "application/json")
-                            val json = JSONObject().apply {
-                                put("action", "CLEAR_SLOT")
-                                put("slot_id", slotId)
-                                put("tier", UserTierManager.getTier(this@MainActivity))
-                            }
-                            val out = conn.outputStream
-                            out.write(json.toString().toByteArray(Charsets.UTF_8))
-                            out.flush()
-                            out.close()
-                            if (conn.responseCode in 200..299) break
-                        } catch (_: Exception) {}
-                    }
                 }
             }
+
+            // 2. Pull all filled slots from iOS / macOS into Android
+            for (port in ports) {
+                try {
+                    val url = URL("http://$targetIp:$port/get_all_slots")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.requestMethod = "GET"
+                    conn.connectTimeout = 2500
+                    conn.readTimeout = 2500
+                    conn.setRequestProperty("X-RATT-Token", token)
+                    if (conn.responseCode in 200..299) {
+                        val body = conn.inputStream.bufferedReader().readText()
+                        val json = JSONObject(body)
+                        val slotsObj = json.optJSONObject("slots")
+                        if (slotsObj != null) {
+                            for (slotId in 1..10) {
+                                val remoteText = slotsObj.optString(slotId.toString(), "")
+                                if (remoteText.isNotEmpty()) {
+                                    SlotRepository.put(slotId, remoteText)
+                                    FloatingAssistService.activeInstance?.updateSlotFromExternal(slotId, remoteText)
+                                    pulled++
+                                }
+                            }
+                        }
+                        break
+                    }
+                } catch (_: Exception) {}
+            }
+
             Handler(Looper.getMainLooper()).post {
-                Toast.makeText(this@MainActivity, "Cross-Platform Sync: Synchronized slots with $platformName ($targetIp)!", Toast.LENGTH_SHORT).show()
+                refreshSlotsUI()
+                Toast.makeText(
+                    this@MainActivity,
+                    "Synced with $platformName ($targetIp): Pushed $pushed, Pulled $pulled slot(s)!",
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }
     }

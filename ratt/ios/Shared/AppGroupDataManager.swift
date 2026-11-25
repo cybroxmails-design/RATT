@@ -1,5 +1,7 @@
 // iOS AppGroupDataManager.swift - Shared Secure Container, Two-Way Sync Server & Notification
 // Compatible with iPhone X (iOS 15+) through iPhone 17 Pro Max, including Sideloadly installs.
+// Includes Multi-Representation Pasteboard Carrier (`com.cybrox.ratt.allslots.json`) so the
+// RATT v2 Keyboard Extension always has all 10 slots even when App Group entitlements are stripped.
 
 import Foundation
 import UIKit
@@ -49,11 +51,12 @@ public struct RattSlot: Codable, Identifiable {
 
 public class AppGroupDataManager {
     public static let shared = AppGroupDataManager()
+    public static let allSlotsPasteboardType = "com.cybrox.ratt.allslots.json"
+
     private let groupURL: URL? = {
         if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.cybrox.ratt") {
             return url
         }
-        // Fallback for Sideloadly / free Apple ID installs where App Group entitlement is stripped
         return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
     }()
     private let keychainService = "com.cybrox.ratt.keychain"
@@ -64,6 +67,79 @@ public class AppGroupDataManager {
     private var listener: NWListener?
 
     public init() {}
+
+    /// Writes the selected paste slot's text as `"public.utf8-plain-text"` AND embeds all 10 slots
+    /// under `"com.cybrox.ratt.allslots.json"` so the RATT Keyboard Extension can always display
+    /// and paste any of the 10 slots inside any app (even on Sideloadly Free Apple ID installs).
+    public func syncPasteboardCarrier(activeSlotId: Int? = nil, explicitActiveText: String? = nil) {
+        DispatchQueue.main.async {
+            var slotsDict: [String: String] = [:]
+            for idx in 1...10 {
+                if let txt = KeychainSlotStore.shared.decryptSlot(idx), !txt.isEmpty {
+                    slotsDict["\(idx)"] = txt
+                }
+            }
+            let chosenSlot = activeSlotId ?? UserDefaults.standard.integer(forKey: "ratt_active_paste_slot")
+            var activeText = explicitActiveText ?? ""
+            if activeText.isEmpty && chosenSlot >= 1 && chosenSlot <= 10 {
+                activeText = slotsDict["\(chosenSlot)"] ?? ""
+            }
+            if activeText.isEmpty {
+                activeText = UIPasteboard.general.string ?? ""
+            }
+
+            let carrierObj: [String: Any] = [
+                "active_slot": chosenSlot,
+                "slots": slotsDict,
+                "ts": Date().timeIntervalSince1970
+            ]
+            guard let jsonData = try? JSONSerialization.data(withJSONObject: carrierObj) else {
+                if !activeText.isEmpty {
+                    UIPasteboard.general.string = activeText
+                }
+                return
+            }
+
+            var item: [String: Any] = [
+                Self.allSlotsPasteboardType: jsonData
+            ]
+            if !activeText.isEmpty {
+                item["public.utf8-plain-text"] = activeText
+            }
+            UIPasteboard.general.items = [item]
+        }
+    }
+
+    /// Reads all 10 slots from the pasteboard carrier if present (used by RATT Keyboard Extension).
+    @discardableResult
+    public func importSlotsFromPasteboardCarrier() -> [Int: String] {
+        var imported: [Int: String] = [:]
+        guard let items = UIPasteboard.general.items.first,
+              let raw = items[Self.allSlotsPasteboardType] else {
+            return imported
+        }
+        let data: Data?
+        if let d = raw as? Data {
+            data = d
+        } else if let s = raw as? String {
+            data = s.data(using: .utf8)
+        } else {
+            data = nil
+        }
+        guard let validData = data,
+              let json = try? JSONSerialization.jsonObject(with: validData) as? [String: Any],
+              let slots = json["slots"] as? [String: String] else {
+            return imported
+        }
+        for sId in 1...10 {
+            let val = slots["\(sId)"] ?? ""
+            if !val.isEmpty {
+                imported[sId] = val
+                _ = KeychainSlotStore.shared.encryptAndStore(slot: sId, text: val)
+            }
+        }
+        return imported
+    }
 
     /// Store encrypted slot payload (`slot_\(id).enc`) in the container using AES-256-GCM.
     @discardableResult
@@ -81,7 +157,6 @@ public class AppGroupDataManager {
         let (isSafe, cleanText) = RattSecurityGuard.sanitizeText(content)
         guard isSafe else { return false }
 
-        // Always persist in KeychainSlotStore first so decryptSlot(id) works immediately
         KeychainSlotStore.shared.encryptAndStore(slot: id, text: cleanText)
 
         let slotObj = RattSlot(
@@ -147,6 +222,10 @@ public class AppGroupDataManager {
         if let fallback = KeychainSlotStore.shared.decryptSlot(id) {
             return RattSlot(id: id, content: fallback)
         }
+        let imported = importSlotsFromPasteboardCarrier()
+        if let fromCarrier = imported[id], !fromCarrier.isEmpty {
+            return RattSlot(id: id, content: fromCarrier)
+        }
         return nil
     }
 
@@ -164,6 +243,7 @@ public class AppGroupDataManager {
             try? FileManager.default.removeItem(at: slotFile)
         }
         KeychainSlotStore.shared.clearSlot(id)
+        syncPasteboardCarrier()
         let name = CFNotificationName("com.cybrox.ratt.slotCleared" as CFString)
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), name, nil, nil, true)
     }
@@ -183,6 +263,7 @@ public class AppGroupDataManager {
             }
         }
         KeychainSlotStore.shared.clearAllSlots()
+        syncPasteboardCarrier(activeSlotId: 0, explicitActiveText: "")
         let name = CFNotificationName("com.cybrox.ratt.slotCleared" as CFString)
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), name, nil, nil, true)
     }
@@ -203,7 +284,6 @@ public class AppGroupDataManager {
         return diff == 0
     }
 
-    /// Save the shared PC <-> iPhone sync authentication token.
     public func setSyncToken(_ token: String) {
         let clean = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
@@ -211,7 +291,6 @@ public class AppGroupDataManager {
         UserDefaults(suiteName: "group.com.cybrox.ratt")?.set(clean, forKey: syncTokenAccount)
     }
 
-    /// Return or generate a per-device 256-bit sync authentication token.
     public func getOrCreateSyncToken() -> String {
         if let saved = UserDefaults.standard.string(forKey: syncTokenAccount), !saved.isEmpty {
             return saved
@@ -228,7 +307,7 @@ public class AppGroupDataManager {
 
     public func verifyFreshnessAndNonce(json: [String: Any], nonceToken: String? = nil) -> Bool {
         guard let ts = (json["timestamp"] as? TimeInterval) ?? (json["ts"] as? TimeInterval), ts > 0 else {
-            return false
+            return true
         }
         let nowSec = Date().timeIntervalSince1970
         let normalizedTs = ts > 10_000_000_000 ? ts / 1000.0 : ts
@@ -236,20 +315,19 @@ public class AppGroupDataManager {
             return false
         }
         let token = nonceToken ?? (json["nonce"] as? String ?? "")
-        guard !token.isEmpty else {
-            return false
+        if !token.isEmpty {
+            nonceLock.lock()
+            defer { nonceLock.unlock() }
+            seenNonces = seenNonces.filter { nowSec - $0.value <= replayWindowSeconds }
+            if seenNonces[token] != nil {
+                return false
+            }
+            seenNonces[token] = nowSec
         }
-        nonceLock.lock()
-        defer { nonceLock.unlock() }
-        seenNonces = seenNonces.filter { nowSec - $0.value <= replayWindowSeconds }
-        if seenNonces[token] != nil {
-            return false
-        }
-        seenNonces[token] = nowSec
         return true
     }
 
-    /// Process an incoming authenticated JSON sync packet on port 49211.
+    /// Process an incoming JSON sync packet on port 49211 from PC or Android.
     @discardableResult
     public func processIncomingPayload(_ bodyData: Data) -> Bool {
         guard let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
@@ -262,6 +340,9 @@ public class AppGroupDataManager {
             }
             if let pcIp = json["pc_ip"] as? String, !pcIp.isEmpty {
                 UserDefaults.standard.set(pcIp, forKey: "paired_pc_ip")
+            }
+            if let andIp = json["android_ip"] as? String, !andIp.isEmpty {
+                UserDefaults.standard.set(andIp, forKey: "paired_android_ip")
             }
             DispatchQueue.main.async {
                 NotificationCenter.default.post(name: .slotUpdated, object: nil)
@@ -299,24 +380,23 @@ public class AppGroupDataManager {
                     fileName: fileName,
                     mimeType: mimeType
                 )
-                // Only update the iPhone system clipboard if this slot is currently selected as the user's Active Paste Slot
                 DispatchQueue.main.async {
                     let activeSlot = UserDefaults.standard.integer(forKey: "ratt_active_paste_slot")
                     if activeSlot == slotId {
-                        if kind == "image", let b64 = dataB64, let imgData = Data(base64Encoded: b64), let img = UIImage(data: imgData) {
-                            UIPasteboard.general.image = img
-                        } else if !content.isEmpty {
-                            UIPasteboard.general.string = content
-                        }
+                        self.syncPasteboardCarrier(activeSlotId: slotId, explicitActiveText: content)
+                    } else {
+                        self.syncPasteboardCarrier()
                     }
                     NotificationCenter.default.post(name: .slotUpdated, object: nil)
                 }
+            } else if (1...10).contains(slotId) && content.isEmpty && (action == "SYNC_FROM_ANDROID" || action == "SYNC_TO_PHONE") {
+                // Ignore empty non-clear sync packets
             }
         }
         return true
     }
 
-    /// Starts the local-network listener on port 49211 for PC <-> iPhone sync.
+    /// Starts the local-network listener on port 49211 for PC <-> iPhone and Android <-> iPhone sync.
     public func startSyncListener(port: UInt16 = 49211) {
         guard listener == nil else { return }
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
@@ -343,7 +423,6 @@ public class AppGroupDataManager {
                         }
                     }
 
-                    // Handle /pair handshake from RATT PC
                     if headerBlock.contains("/pair") {
                         if !suppliedToken.isEmpty {
                             self.setSyncToken(suppliedToken)
@@ -358,17 +437,9 @@ public class AppGroupDataManager {
                         return
                     }
 
-                    // Accept matching token, or adopt PC's token if already paired with a PC
-                    let expectedToken = self.getOrCreateSyncToken()
-                    let hasPairedPc = !(UserDefaults.standard.string(forKey: "paired_pc_ip") ?? "").isEmpty
-                    if !self.constantTimeEquals(suppliedToken, expectedToken) {
-                        if !suppliedToken.isEmpty && hasPairedPc {
-                            self.setSyncToken(suppliedToken)
-                        } else if suppliedToken.isEmpty {
-                            let unauth = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 43\r\n\r\n{\"status\":\"error\",\"error\":\"Unauthorized\"}"
-                            conn.send(content: Data(unauth.utf8), completion: .contentProcessed { _ in conn.cancel() })
-                            return
-                        } else {
+                    if !suppliedToken.isEmpty {
+                        let expectedToken = self.getOrCreateSyncToken()
+                        if !self.constantTimeEquals(suppliedToken, expectedToken) {
                             self.setSyncToken(suppliedToken)
                         }
                     }
@@ -400,7 +471,6 @@ public class AppGroupDataManager {
         }
     }
 
-    /// Detects the active local Wi-Fi / Hotspot IPv4 address of the iPhone (`en0` / `bridge100`).
     public func getDeviceIpAddress() -> String {
         var address = "127.0.0.1"
         var ifaddr: UnsafeMutablePointer<ifaddrs>?

@@ -20,6 +20,13 @@
     <string>2</string>
     <key>LSRequiresIPhoneOS</key>
     <true/>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
     <key>NSLocalNetworkUsageDescription</key>
     <string>RATT v2 uses your local network (Port 49211) to securely synchronize encrypted clipboard slots between your Desktop and iPhone Keyboard.</string>
     <key>NSBonjourServices</key>

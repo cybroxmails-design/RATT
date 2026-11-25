@@ -37,6 +37,7 @@ class RattKeyboardViewController: UIInputViewController {
 
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
+        _ = dataManager.importSlotsFromPasteboardCarrier()
         refreshPaletteCards()
         pullSlotsFromLocalhostIfAvailable()
     }

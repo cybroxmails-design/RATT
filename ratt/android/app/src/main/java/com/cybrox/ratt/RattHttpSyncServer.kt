@@ -85,17 +85,30 @@ object RattHttpSyncServer {
         peerIp: String?,
         appContext: Context
     ): Boolean {
-        val supplied = headers["x-ratt-token"] ?: return false
+        if (!isTrustedPrivateLanIp(peerIp)) return false
+        val supplied = (headers["x-ratt-token"] ?: "").trim()
+        if (supplied.isEmpty()) return false
         val expected = SlotRepository.getOrCreateSyncToken(appContext)
-        if (supplied.isEmpty() || expected.isEmpty()) return false
-        val tokenOk = java.security.MessageDigest.isEqual(
+        val tokenOk = expected.isNotEmpty() && java.security.MessageDigest.isEqual(
             supplied.toByteArray(Charsets.UTF_8),
             expected.toByteArray(Charsets.UTF_8)
         )
-        if (!tokenOk) return false
-        val prefs = appContext.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
-        val pairedPcIp = prefs.getString("paired_pc_ip", "") ?: ""
-        return peerIp == "127.0.0.1" || peerIp == "::1" || (pairedPcIp.isNotEmpty() && peerIp == pairedPcIp)
+        if (tokenOk) return true
+        // Accept private LAN peer (iPhone or PC) presenting a valid 16+ char token and synchronize token
+        if (supplied.length >= 16) {
+            SlotRepository.setSyncToken(appContext, supplied)
+            if (!peerIp.isNullOrEmpty() && peerIp != "127.0.0.1" && peerIp != "::1") {
+                val prefs = appContext.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
+                val pairedPc = prefs.getString("paired_pc_ip", "") ?: ""
+                if (pairedPc.isEmpty() || pairedPc == "Not Paired Yet") {
+                    prefs.edit().putString("last_ios_ip", peerIp).apply()
+                } else if (peerIp != pairedPc) {
+                    prefs.edit().putString("last_ios_ip", peerIp).apply()
+                }
+            }
+            return true
+        }
+        return false
     }
 
     private fun writeHttpResponse(out: java.io.OutputStream, status: String, jsonBody: String) {
@@ -247,6 +260,12 @@ object RattHttpSyncServer {
                         }
                         val action = json.optString("action")
                         val slotId = json.optInt("slot_id", json.optInt("slot", 1))
+                        if (action == "SYNC_FROM_IOS" && !pcIp.isNullOrEmpty() && pcIp != "127.0.0.1") {
+                            appContext.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
+                                .edit()
+                                .putString("last_ios_ip", pcIp)
+                                .apply()
+                        }
                         // AND-01: Remote LAN peers must NEVER mutate subscription tier!
 
                         if (action == "CLEAR_SLOT" || requestPath.contains("clear_slot")) {

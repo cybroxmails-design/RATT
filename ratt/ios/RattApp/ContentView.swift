@@ -1,12 +1,13 @@
 // ContentView.swift — RATT v2 for iOS Container App (iPhone X through iPhone 17 Pro Max)
 // Full Feature Parity with RATT Android & PC:
 // 1. Compatible with iPhone X (iOS 15/16) and all newer iPhones up to iPhone 17 Pro Max
-// 2. Choose Any Slot (1–10) to Paste:
-//    - Dedicated "CHOOSE SLOT TO PASTE (1–10)" Picker & 10-Slot Quick-Paste Grid
-//    - Tap any slot (or its "Paste This" button) to load THAT chosen slot into the iPhone Clipboard
-//    - Active Paste Slot badge ("✓ ACTIVE") clearly shows which slot is currently ready to paste
-// 3. Touch anywhere outside text fields to minimize keyboard + dedicated Hide Keyboard button
-// 4. Direct Wi-Fi Pairing & Two-Way Sync with RATT PC (ports 49211 / 49210)
+// 2. Native In-App 10-Slot Chooser Modal for Pasting & Saving:
+//    - Tap "📤 Choose Slot to Paste (1–10)" to open a full 10-Slot Popup Chooser
+//    - Choose ANY slot (#1 to #10) to load into your iPhone Clipboard or paste directly
+//    - Syncs all 10 slots into the RATT Keyboard Pasteboard Carrier so the RATT Keyboard
+//      also lets you choose any slot (#1–#10) inside WhatsApp, Notes, Safari, or Messages
+// 3. Direct Two-Way Wi-Fi Sync with BOTH RATT Android (Port 49210) and RATT PC (Port 49211)
+// 4. Touch anywhere outside text fields to minimize keyboard
 
 import SwiftUI
 import UIKit
@@ -54,18 +55,18 @@ public struct ContentView: View {
     @State private var userTier: RattUserTier = .basic
     @State private var slotPreviews: [Int: String] = [:]
     @State private var activePasteSlot: Int = 0
-    @State private var lastSavedTexts: Set<String> = []
     @State private var directInputText: String = ""
-    @State private var statusMessage: String = "RATT v2 Ready • Choose any slot (1–10) below to paste"
+    @State private var statusMessage: String = "RATT v2 Ready • Tap 'Choose Slot to Paste' to pick any slot (1–10)"
     @State private var statusIsSuccess: Bool = true
     @State private var showUpgradeAlert: Bool = false
     @State private var upgradeReason: String = ""
     @State private var showPairDialog: Bool = false
     @State private var pairIpDraft: String = ""
-    @State private var showSaveSlotSheet: Bool = false
-    @State private var showPasteSlotSheet: Bool = false
-    @State private var showCrossSyncAlert: Bool = false
-    @State private var crossSyncTarget: String = ""
+    @State private var showAndroidSyncBox: Bool = false
+    @State private var androidIpDraft: String = ""
+    @State private var androidIpAddress: String = ""
+    @State private var showPasteSlotModal: Bool = false
+    @State private var showSaveSlotModal: Bool = false
     @State private var pcIpAddress: String = ""
     @State private var iphoneIpAddress: String = ""
 
@@ -149,8 +150,8 @@ public struct ContentView: View {
                                 Spacer()
                             }
                             if activePasteSlot > 0, let activeTxt = slotPreviews[activePasteSlot], !activeTxt.isEmpty {
-                                Text("📌 Ready to Paste: Slot #\(activePasteSlot) (\"\(activeTxt)\")")
-                                    .font(.system(size: 10.5, weight: .bold))
+                                Text("📌 Selected to Paste Now: Slot #\(activePasteSlot) (\"\(activeTxt)\")")
+                                    .font(.system(size: 11, weight: .bold))
                                     .foregroundColor(Color(hex: "#39FF14"))
                                     .lineLimit(1)
                             }
@@ -167,7 +168,7 @@ public struct ContentView: View {
                             dismissKeyboard()
                         }
 
-                        // ================= 2. CHOOSE SLOT TO PASTE (1-10) =================
+                        // ================= 2. CHOOSE WHICH SLOT TO PASTE (1-10) =================
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 Text("1️⃣ CHOOSE WHICH SLOT TO PASTE (1–10)")
@@ -181,28 +182,30 @@ public struct ContentView: View {
                                 }
                             }
 
-                            // Big Slot Picker Button to Choose from Slots 1-10 for Pasting
+                            // Opens the In-App 10-Slot Chooser Modal (Works reliably on all iOS versions!)
                             Button(action: {
                                 dismissKeyboard()
-                                showPasteSlotSheet = true
+                                refreshSlots()
+                                showPasteSlotModal = true
                             }) {
                                 HStack {
-                                    Image(systemName: "doc.on.clipboard.fill")
-                                    Text(activePasteSlot > 0 ? "📤 Choose Slot to Paste (Currently Slot #\(activePasteSlot))..." : "📤 Choose Slot to Paste (Slots 1–10)...")
+                                    Image(systemName: "list.number")
+                                    Text(activePasteSlot > 0
+                                         ? "📤 Choose Slot to Paste (Active: Slot #\(activePasteSlot))..."
+                                         : "📤 Choose Slot to Paste (Pick from Slots 1–10)...")
                                 }
                                 .font(.system(size: 13, weight: .bold))
                                 .foregroundColor(.black)
                                 .frame(maxWidth: .infinity)
-                                .frame(height: 40)
+                                .frame(height: 42)
                                 .background(Color(hex: "#39FF14"))
                                 .cornerRadius(6)
                             }
 
-                            Text("Or tap any filled slot button below to select it as your active Paste slot:")
+                            Text("Or tap a slot number below to select which slot (1–10) you want to paste:")
                                 .font(.system(size: 10))
                                 .foregroundColor(Color(hex: "#8B949E"))
 
-                            // 10 Quick "Select to Paste" Buttons
                             VStack(spacing: 6) {
                                 HStack(spacing: 5) {
                                     ForEach(1...5, id: \.self) { slotId in
@@ -237,7 +240,7 @@ public struct ContentView: View {
                             }
 
                             HStack(spacing: 6) {
-                                TextField("Type or paste new text here to save into a slot...", text: $directInputText)
+                                TextField("Type text here (or tap Paste from Slot below)...", text: $directInputText)
                                     .font(.system(size: 13))
                                     .foregroundColor(.white)
                                     .padding(10)
@@ -257,22 +260,40 @@ public struct ContentView: View {
                                 }
                             }
 
-                            Button(action: {
-                                dismissKeyboard()
-                                showSaveSlotSheet = true
-                            }) {
-                                HStack {
-                                    Image(systemName: "square.and.arrow.down.fill")
-                                    Text(directInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                                         ? "📥 Save Copied iPhone Clipboard to Slot (Choose 1–10)..."
-                                         : "📥 Save Typed Text Above to Slot (Choose 1–10)...")
+                            HStack(spacing: 8) {
+                                Button(action: {
+                                    dismissKeyboard()
+                                    refreshSlots()
+                                    showSaveSlotModal = true
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "square.and.arrow.down.fill")
+                                        Text("Save to Slot (1–10)...")
+                                    }
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 38)
+                                    .background(Color(hex: "#00BFFF"))
+                                    .cornerRadius(6)
                                 }
-                                .font(.system(size: 12.5, weight: .bold))
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 38)
-                                .background(Color(hex: "#00BFFF"))
-                                .cornerRadius(6)
+
+                                Button(action: {
+                                    dismissKeyboard()
+                                    refreshSlots()
+                                    showPasteSlotModal = true
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "doc.on.clipboard.fill")
+                                        Text("Paste from Slot (1–10)...")
+                                    }
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundColor(.black)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 38)
+                                    .background(Color(hex: "#39FF14"))
+                                    .cornerRadius(6)
+                                }
                             }
                         }
                         .padding(14)
@@ -281,9 +302,9 @@ public struct ContentView: View {
                         .cornerRadius(10)
                         .padding(.horizontal)
 
-                        // ================= 4. LIVE 10-SLOT PREVIEW (TAP 'PASTE THIS' ON ANY SLOT) =================
+                        // ================= 4. LIVE 10-SLOT PREVIEW =================
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("LIVE 10-SLOT PREVIEW (TAP 'PASTE THIS' TO CHOOSE SLOT FOR PASTING)")
+                            Text("LIVE 10-SLOT PREVIEW (TAP 'PASTE THIS' ON ANY SLOT TO PASTE IT)")
                                 .font(.system(size: 10, weight: .bold))
                                 .foregroundColor(Color(hex: "#8B949E"))
                                 .padding(.horizontal)
@@ -315,7 +336,121 @@ public struct ContentView: View {
                             .padding(.top, 4)
                         }
 
-                        // ================= 5. IP / WI-FI SYNC CARD =================
+                        // ================= 5. SYNC WITH ANDROID & MACOS =================
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("3️⃣ SYNC WITH RATT ANDROID & MACOS (TWO-WAY WI-FI SYNC)")
+                                .font(.system(size: 10.5, weight: .bold))
+                                .foregroundColor(Color(hex: "#39FF14"))
+
+                            HStack(spacing: 8) {
+                                Button(action: {
+                                    dismissKeyboard()
+                                    androidIpDraft = androidIpAddress
+                                    showAndroidSyncBox.toggle()
+                                }) {
+                                    HStack {
+                                        Image(systemName: "phone.connection.fill")
+                                        Text(androidIpAddress.isEmpty ? "📱 Pair / Sync with Android" : "📱 Sync Android (\(androidIpAddress))")
+                                    }
+                                    .font(.system(size: 11.5, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 40)
+                                    .background(Color(hex: "#2563EB"))
+                                    .cornerRadius(6)
+                                }
+
+                                Button(action: {
+                                    dismissKeyboard()
+                                    if !pcIpAddress.isEmpty {
+                                        syncWithAndroidDevice(targetIp: pcIpAddress, platformLabel: "macOS", port: 49211)
+                                    } else {
+                                        pairIpDraft = pcIpAddress
+                                        showPairDialog = true
+                                    }
+                                }) {
+                                    HStack {
+                                        Image(systemName: "laptopcomputer")
+                                        Text("💻 Sync with macOS")
+                                    }
+                                    .font(.system(size: 11.5, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 40)
+                                    .background(Color(hex: "#7C3AED"))
+                                    .cornerRadius(6)
+                                }
+                            }
+
+                            if showAndroidSyncBox || !androidIpAddress.isEmpty {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Enter the green IP Address shown on your RATT Android screen (Port 49210):")
+                                        .font(.system(size: 11, weight: .semibold))
+                                        .foregroundColor(Color(hex: "#E6EDF3"))
+
+                                    HStack(spacing: 8) {
+                                        TextField("Android Phone IP (e.g. 10.191.126.x)", text: $androidIpDraft)
+                                            .keyboardType(.numbersAndPunctuation)
+                                            .autocapitalization(.none)
+                                            .disableAutocorrection(true)
+                                            .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                            .foregroundColor(Color(hex: "#39FF14"))
+                                            .padding(10)
+                                            .background(Color(hex: "#0D1117"))
+                                            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(hex: "#2563EB"), lineWidth: 1))
+                                            .cornerRadius(6)
+
+                                        Button("Hide ⌨️") {
+                                            dismissKeyboard()
+                                        }
+                                        .font(.system(size: 11, weight: .bold))
+                                        .foregroundColor(Color(hex: "#C9D1D9"))
+                                        .padding(.horizontal, 10)
+                                        .frame(height: 38)
+                                        .background(Color(hex: "#21262D"))
+                                        .cornerRadius(6)
+                                    }
+
+                                    HStack(spacing: 8) {
+                                        Button(action: {
+                                            dismissKeyboard()
+                                            let cleanIp = (androidIpDraft.isEmpty ? androidIpAddress : androidIpDraft)
+                                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                                            guard !cleanIp.isEmpty else {
+                                                setStatus("Please enter the IP address shown on your RATT Android phone.", ok: false)
+                                                return
+                                            }
+                                            androidIpAddress = cleanIp
+                                            androidIpDraft = cleanIp
+                                            UserDefaults.standard.set(cleanIp, forKey: "paired_android_ip")
+                                            syncWithAndroidDevice(targetIp: cleanIp, platformLabel: "Android", port: 49210)
+                                        }) {
+                                            HStack {
+                                                Image(systemName: "arrow.triangle.2.circlepath")
+                                                Text("🔄 Sync All 10 Slots with Android Now")
+                                            }
+                                            .font(.system(size: 12, weight: .bold))
+                                            .foregroundColor(.white)
+                                            .frame(maxWidth: .infinity)
+                                            .frame(height: 38)
+                                            .background(Color(hex: "#10B981"))
+                                            .cornerRadius(6)
+                                        }
+                                    }
+                                }
+                                .padding(10)
+                                .background(Color(hex: "#0D1117"))
+                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(hex: "#2563EB"), lineWidth: 1))
+                                .cornerRadius(8)
+                            }
+                        }
+                        .padding(14)
+                        .background(Color(hex: "#161B22"))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(hex: "#30363D"), lineWidth: 1))
+                        .cornerRadius(10)
+                        .padding(.horizontal)
+
+                        // ================= 6. IP / WI-FI PC SYNC CARD =================
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -360,7 +495,7 @@ public struct ContentView: View {
                             .onTapGesture {
                                 dismissKeyboard()
                                 pairIpDraft = pcIpAddress
-                                showPairDialog = true
+                                showPairDialog.toggle()
                             }
 
                             if showPairDialog {
@@ -492,7 +627,7 @@ public struct ContentView: View {
                         .cornerRadius(10)
                         .padding(.horizontal)
 
-                        // ================= 6. KEYBOARD SETUP & PERMISSION DIAGNOSTICS =================
+                        // ================= 7. KEYBOARD SETUP & PERMISSION DIAGNOSTICS =================
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 HStack(spacing: 6) {
@@ -537,109 +672,7 @@ public struct ContentView: View {
                             dismissKeyboard()
                         }
 
-                        // ================= 7. CROSS-PLATFORM SYNC =================
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("CROSS-PLATFORM SYNC (PREMIUM & ENTERPRISE)")
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(Color(hex: "#8B949E"))
-
-                            HStack(spacing: 8) {
-                                Button(action: {
-                                    dismissKeyboard()
-                                    handleCrossSync(target: "macOS")
-                                }) {
-                                    HStack {
-                                        Image(systemName: "laptopcomputer")
-                                        Text("💻 Sync with macOS")
-                                    }
-                                    .font(.system(size: 11.5, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 38)
-                                    .background(Color(hex: "#7C3AED"))
-                                    .cornerRadius(6)
-                                }
-
-                                Button(action: {
-                                    dismissKeyboard()
-                                    handleCrossSync(target: "Android")
-                                }) {
-                                    HStack {
-                                        Image(systemName: "phone.fill")
-                                        Text("📱 Sync with Android")
-                                    }
-                                    .font(.system(size: 11.5, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 38)
-                                    .background(Color(hex: "#2563EB"))
-                                    .cornerRadius(6)
-                                }
-                            }
-                        }
-                        .padding(.horizontal)
-                        .padding(.top, 6)
-
-                        // ================= 8. SHARE, MIRROR & TRANSLATE =================
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("SHARE, MIRROR & 9-LANGUAGE TRANSLATION (PREMIUM & ENTERPRISE)")
-                                .font(.system(size: 10, weight: .bold))
-                                .foregroundColor(Color(hex: "#8B949E"))
-
-                            HStack(spacing: 8) {
-                                Button(action: {
-                                    dismissKeyboard()
-                                    handleShare()
-                                }) {
-                                    HStack {
-                                        Image(systemName: "person.2.fill")
-                                        Text("Share with Account")
-                                    }
-                                    .font(.system(size: 11.5, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 38)
-                                    .background(Color(hex: "#059669"))
-                                    .cornerRadius(6)
-                                }
-
-                                Button(action: {
-                                    dismissKeyboard()
-                                    handleMirror()
-                                }) {
-                                    HStack {
-                                        Image(systemName: "rectangle.2.swap")
-                                        Text("Mirror Devices")
-                                    }
-                                    .font(.system(size: 11.5, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 38)
-                                    .background(Color(hex: "#D97706"))
-                                    .cornerRadius(6)
-                                }
-                            }
-
-                            Button(action: {
-                                dismissKeyboard()
-                                handleTranslate()
-                            }) {
-                                HStack {
-                                    Image(systemName: "globe")
-                                    Text("🌐 Translate Slot Text (9 Languages)")
-                                }
-                                .font(.system(size: 11.5, weight: .bold))
-                                .foregroundColor(.white)
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 36)
-                                .background(Color(hex: "#0284C7"))
-                                .cornerRadius(6)
-                            }
-                        }
-                        .padding(.horizontal)
-                        .padding(.top, 4)
-
-                        // ================= 9. EXIT & WIPE SLOTS =================
+                        // ================= 8. EXIT & WIPE SLOTS =================
                         Button(action: {
                             dismissKeyboard()
                             emptySlotsAndExit()
@@ -659,6 +692,197 @@ public struct ContentView: View {
                         .padding(.horizontal)
                         .padding(.bottom, 24)
                     }
+                }
+
+                // ================= IN-APP MODAL 1: CHOOSE WHICH SLOT TO PASTE (1-10) =================
+                if showPasteSlotModal {
+                    Color.black.opacity(0.75)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            showPasteSlotModal = false
+                        }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("📤 Choose Slot to Paste (1–10)")
+                                .font(.system(size: 16, weight: .heavy))
+                                .foregroundColor(Color(hex: "#39FF14"))
+                            Spacer()
+                            Button(action: {
+                                showPasteSlotModal = false
+                            }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 22))
+                                    .foregroundColor(Color(hex: "#8B949E"))
+                            }
+                        }
+
+                        Text("Tap any slot below to load it into your iPhone Clipboard & paste it:")
+                            .font(.system(size: 11.5))
+                            .foregroundColor(Color(hex: "#C9D1D9"))
+
+                        ScrollView {
+                            VStack(spacing: 8) {
+                                ForEach(1...10, id: \.self) { s in
+                                    let txt = slotPreviews[s] ?? ""
+                                    let hasData = !txt.isEmpty
+                                    let isSelected = (activePasteSlot == s) && hasData
+                                    let sColor = PC_SLOT_COLORS[s - 1]
+
+                                    Button(action: {
+                                        if hasData {
+                                            copySlotToIphoneClipboard(slotId: s, alsoInsertInInputBox: true)
+                                            showPasteSlotModal = false
+                                        } else {
+                                            setStatus("Slot #\(s) is empty. Save text into Slot #\(s) first.", ok: false)
+                                        }
+                                    }) {
+                                        HStack(spacing: 10) {
+                                            Text("#\(s)")
+                                                .font(.system(size: 12, weight: .bold))
+                                                .foregroundColor(.white)
+                                                .frame(width: 34, height: 28)
+                                                .background(hasData ? sColor : Color(hex: "#21262D"))
+                                                .cornerRadius(5)
+
+                                            Text(hasData ? txt : "[Empty Slot]")
+                                                .font(.system(size: 13, weight: hasData ? .bold : .regular))
+                                                .foregroundColor(hasData ? .white : Color(hex: "#6E7681"))
+                                                .lineLimit(1)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                                            if hasData {
+                                                Text(isSelected ? "✓ ACTIVE" : "PASTE")
+                                                    .font(.system(size: 11, weight: .heavy))
+                                                    .foregroundColor(.black)
+                                                    .padding(.horizontal, 10)
+                                                    .padding(.vertical, 5)
+                                                    .background(Color(hex: "#39FF14"))
+                                                    .cornerRadius(5)
+                                            }
+                                        }
+                                        .padding(10)
+                                        .background(isSelected ? Color(hex: "#143828") : (hasData ? Color(hex: "#10241B") : Color(hex: "#12161C")))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .stroke(isSelected ? Color(hex: "#39FF14") : (hasData ? sColor : Color(hex: "#21262D")), lineWidth: hasData ? 1.5 : 1)
+                                        )
+                                        .cornerRadius(8)
+                                    }
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 420)
+
+                        Button(action: {
+                            showPasteSlotModal = false
+                        }) {
+                            Text("Close")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 38)
+                                .background(Color(hex: "#21262D"))
+                                .cornerRadius(6)
+                        }
+                    }
+                    .padding(16)
+                    .background(Color(hex: "#161B22"))
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color(hex: "#39FF14"), lineWidth: 2))
+                    .cornerRadius(14)
+                    .padding(.horizontal, 20)
+                }
+
+                // ================= IN-APP MODAL 2: CHOOSE WHICH SLOT TO SAVE INTO (1-10) =================
+                if showSaveSlotModal {
+                    Color.black.opacity(0.75)
+                        .ignoresSafeArea()
+                        .onTapGesture {
+                            showSaveSlotModal = false
+                        }
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("📥 Save Into Which Slot (1–10)?")
+                                .font(.system(size: 16, weight: .heavy))
+                                .foregroundColor(Color(hex: "#00BFFF"))
+                            Spacer()
+                            Button(action: {
+                                showSaveSlotModal = false
+                            }) {
+                                Image(systemName: "xmark.circle.fill")
+                                    .font(.system(size: 22))
+                                    .foregroundColor(Color(hex: "#8B949E"))
+                            }
+                        }
+
+                        Text("Tap a slot below to store your typed text or current clipboard item:")
+                            .font(.system(size: 11.5))
+                            .foregroundColor(Color(hex: "#C9D1D9"))
+
+                        ScrollView {
+                            VStack(spacing: 8) {
+                                ForEach(1...10, id: \.self) { s in
+                                    let txt = slotPreviews[s] ?? ""
+                                    let hasData = !txt.isEmpty
+                                    let sColor = PC_SLOT_COLORS[s - 1]
+
+                                    Button(action: {
+                                        saveClipboardToSlot(slotId: s)
+                                        showSaveSlotModal = false
+                                    }) {
+                                        HStack(spacing: 10) {
+                                            Text("#\(s)")
+                                                .font(.system(size: 12, weight: .bold))
+                                                .foregroundColor(.white)
+                                                .frame(width: 34, height: 28)
+                                                .background(sColor)
+                                                .cornerRadius(5)
+
+                                            Text(hasData ? "Current: \(txt)" : "[Empty — Tap to Save Here]")
+                                                .font(.system(size: 13, weight: hasData ? .semibold : .regular))
+                                                .foregroundColor(hasData ? .white : Color(hex: "#8B949E"))
+                                                .lineLimit(1)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                                            Text("SAVE")
+                                                .font(.system(size: 11, weight: .heavy))
+                                                .foregroundColor(.white)
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 5)
+                                                .background(Color(hex: "#00BFFF"))
+                                                .cornerRadius(5)
+                                        }
+                                        .padding(10)
+                                        .background(Color(hex: "#12161C"))
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 8)
+                                                .stroke(sColor, lineWidth: 1)
+                                        )
+                                        .cornerRadius(8)
+                                    }
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 420)
+
+                        Button(action: {
+                            showSaveSlotModal = false
+                        }) {
+                            Text("Cancel")
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 38)
+                                .background(Color(hex: "#21262D"))
+                                .cornerRadius(6)
+                        }
+                    }
+                    .padding(16)
+                    .background(Color(hex: "#161B22"))
+                    .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color(hex: "#00BFFF"), lineWidth: 2))
+                    .cornerRadius(14)
+                    .padding(.horizontal, 20)
                 }
             }
             .navigationBarHidden(true)
@@ -696,70 +920,14 @@ public struct ContentView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
-                Text(upgradeReason.isEmpty ? "Current Plan: \(userTier.rawValue.uppercased())\n\nBasic includes 10 slots for text, links, images & SVG diagrams. Cross-platform sync (Android/iOS/macOS), Documents & Media files, 9-Language Translation, and Share & Mirror require Premium or Enterprise." : upgradeReason)
+                Text(upgradeReason.isEmpty ? "Current Plan: \(userTier.rawValue.uppercased())\n\nBasic includes 10 slots for text, links, images & SVG diagrams." : upgradeReason)
             }
-            .alert("Sync with \(crossSyncTarget)", isPresented: $showCrossSyncAlert) {
-                Button("Sync with Paired IP (\(pcIpAddress.isEmpty ? "Set IP First" : pcIpAddress))") {
-                    if !pcIpAddress.isEmpty {
-                        performCrossSync(target: crossSyncTarget, targetIp: pcIpAddress)
-                    } else {
-                        showPairDialog = true
-                    }
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("Sync all 10 slots with your \(crossSyncTarget) device running RATT.")
-            }
-            // Background modifier container for the two separate ActionSheets (Paste Picker vs Save Picker)
-            .background(
-                HStack {
-                    Color.clear
-                        .actionSheet(isPresented: $showPasteSlotSheet) {
-                            var buttons: [ActionSheet.Button] = []
-                            for s in 1...10 {
-                                let preview = slotPreviews[s] ?? ""
-                                let label = preview.isEmpty
-                                    ? "Slot #\(s) — [Empty]"
-                                    : "Slot #\(s): \(preview.count > 36 ? String(preview.prefix(36)) + "..." : preview)"
-                                buttons.append(.default(Text(label)) {
-                                    copySlotToIphoneClipboard(slotId: s)
-                                })
-                            }
-                            buttons.append(.cancel())
-                            return ActionSheet(
-                                title: Text("Choose Which Slot (1–10) to Paste"),
-                                message: Text("Select a slot below to load it into your iPhone Clipboard for pasting:"),
-                                buttons: buttons
-                            )
-                        }
-                    Color.clear
-                        .actionSheet(isPresented: $showSaveSlotSheet) {
-                            var buttons: [ActionSheet.Button] = []
-                            for s in 1...10 {
-                                let preview = slotPreviews[s] ?? ""
-                                let label = preview.isEmpty
-                                    ? "Save into Slot #\(s) [Empty]"
-                                    : "Overwrite Slot #\(s) (\(preview.count > 24 ? String(preview.prefix(24)) + "..." : preview))"
-                                buttons.append(.default(Text(label)) {
-                                    saveClipboardToSlot(slotId: s)
-                                })
-                            }
-                            buttons.append(.cancel())
-                            return ActionSheet(
-                                title: Text("Save into Which Slot (1–10)?"),
-                                message: Text("Choose the slot number where you want to store this item:"),
-                                buttons: buttons
-                            )
-                        }
-                }
-            )
         }
         .navigationViewStyle(StackNavigationViewStyle())
     }
 
     // ================= SUB-VIEWS =================
 
-    /// Quick button in the "1️⃣ CHOOSE WHICH SLOT TO PASTE" grid — ALWAYS selects that slot for pasting!
     @ViewBuilder
     private func quickPasteSlotButton(slotId: Int) -> some View {
         let content = slotPreviews[slotId]
@@ -770,7 +938,7 @@ public struct ContentView: View {
         Button(action: {
             dismissKeyboard()
             if hasData {
-                copySlotToIphoneClipboard(slotId: slotId)
+                copySlotToIphoneClipboard(slotId: slotId, alsoInsertInInputBox: false)
             } else {
                 setStatus("Slot #\(slotId) is empty. Save text into Slot #\(slotId) first.", ok: false)
             }
@@ -821,7 +989,7 @@ public struct ContentView: View {
                     .contentShape(Rectangle())
                     .onTapGesture {
                         dismissKeyboard()
-                        copySlotToIphoneClipboard(slotId: slotId)
+                        copySlotToIphoneClipboard(slotId: slotId, alsoInsertInInputBox: false)
                     }
             } else {
                 Text("Slot \(slotId): [Empty]")
@@ -832,12 +1000,11 @@ public struct ContentView: View {
             }
 
             if hasData {
-                // Choose This Slot to Paste Button
                 Button(action: {
                     dismissKeyboard()
-                    copySlotToIphoneClipboard(slotId: slotId)
+                    copySlotToIphoneClipboard(slotId: slotId, alsoInsertInInputBox: false)
                 }) {
-                    Text(isSelectedForPaste ? "✓ Ready" : "Paste This")
+                    Text(isSelectedForPaste ? "✓ Active" : "Paste This")
                         .font(.system(size: 10.5, weight: .bold))
                         .foregroundColor(isSelectedForPaste ? .black : .white)
                         .padding(.horizontal, 8)
@@ -847,7 +1014,6 @@ public struct ContentView: View {
                 }
             }
 
-            // Save Button -> Saves typed text or external clipboard into this Slot
             Button(action: {
                 dismissKeyboard()
                 saveClipboardToSlot(slotId: slotId)
@@ -891,8 +1057,9 @@ public struct ContentView: View {
     }
 
     private func loadPreferences() {
-        let savedPc = UserDefaults.standard.string(forKey: "paired_pc_ip") ?? ""
-        self.pcIpAddress = savedPc
+        self.pcIpAddress = UserDefaults.standard.string(forKey: "paired_pc_ip") ?? ""
+        self.androidIpAddress = UserDefaults.standard.string(forKey: "paired_android_ip") ?? ""
+        self.androidIpDraft = self.androidIpAddress
         self.iphoneIpAddress = dataManager.getDeviceIpAddress()
         self.userTier = RattUserTier(rawValue: store.getUserTier()) ?? .basic
         self.activePasteSlot = UserDefaults.standard.integer(forKey: "ratt_active_paste_slot")
@@ -911,66 +1078,54 @@ public struct ContentView: View {
         if activePasteSlot > 0 && loaded[activePasteSlot] == nil {
             activePasteSlot = 0
         }
+        // Keep the multi-representation pasteboard carrier up to date so the chosen activePasteSlot
+        // is ALWAYS the string on UIPasteboard.general (not just the last copied item!)
+        let activeTxt = (activePasteSlot > 0) ? (loaded[activePasteSlot] ?? "") : ""
+        if !activeTxt.isEmpty {
+            dataManager.syncPasteboardCarrier(activeSlotId: activePasteSlot, explicitActiveText: activeTxt)
+        } else {
+            dataManager.syncPasteboardCarrier()
+        }
     }
 
-    /// Saves text into `slotId` WITHOUT overwriting the user's chosen paste slot or other slots.
+    /// Saves text into `slotId` and preserves the user's chosen `activePasteSlot` on `UIPasteboard.general`.
     private func saveTextToSlot(slotId: Int, text: String) {
-        if !store.isAllowedPayloadForTier(text) {
-            upgradeReason = "UPGRADE REQUIRED: Copying Document & Media files (.docx, .xls, .pdf, .mp4, etc.) is limited to Premium and Enterprise subscribers."
-            showUpgradeAlert = true
-            return
-        }
         let okStore = store.encryptAndStore(slot: slotId, text: text)
         let okGroup = dataManager.saveSlot(id: slotId, content: text)
-        lastSavedTexts.insert(text)
         UINotificationFeedbackGenerator().notificationOccurred(.success)
+
+        // If no active paste slot was selected yet, default to this slot; otherwise keep the user's chosen paste slot
+        if activePasteSlot == 0 {
+            activePasteSlot = slotId
+            UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
+        }
         sendSlotToPc(slotId: slotId, text: text)
+        sendSlotToAndroidIfPaired(slotId: slotId, text: text)
         refreshSlots()
         if okStore || okGroup {
-            // If no active paste slot was selected yet, or if saving into the active paste slot, load it for paste
-            if activePasteSlot == 0 || activePasteSlot == slotId {
-                activePasteSlot = slotId
-                UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
-                UIPasteboard.general.string = text
-            }
-            setStatus("✅ Saved to Slot #\(slotId)! Tap any slot in Section 1️⃣ to choose which slot to paste.", ok: true)
+            setStatus("✅ Saved to Slot #\(slotId)! Tap 'Choose Slot to Paste' to pick any slot (1–10) to paste.", ok: true)
         } else {
             setStatus("⚠️ Security Guard blocked unsafe link or script in Slot #\(slotId).", ok: false)
         }
     }
 
     /// Explicitly chooses `slotId` (1–10) as the Active Paste Slot and loads it into `UIPasteboard.general`.
-    private func copySlotToIphoneClipboard(slotId: Int) {
-        if let slotObj = dataManager.loadSlot(id: slotId) {
-            if slotObj.kind == "image", let b64 = slotObj.dataBase64, let imgData = Data(base64Encoded: b64), let img = UIImage(data: imgData) {
-                UIPasteboard.general.image = img
-                activePasteSlot = slotId
-                UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
-                UINotificationFeedbackGenerator().notificationOccurred(.success)
-                setStatus("📋 Selected Slot #\(slotId) (Image) for Paste!", ok: true)
-                return
-            }
-            if !slotObj.content.isEmpty {
-                UIPasteboard.general.string = slotObj.content
-                activePasteSlot = slotId
-                UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
-                UINotificationFeedbackGenerator().notificationOccurred(.success)
-                setStatus("📋 Slot #\(slotId) is now Active for Paste! Go to any app and tap Paste.", ok: true)
-                return
-            }
-        }
-        if let txt = slotPreviews[slotId] ?? store.decryptSlot(slotId), !txt.isEmpty {
-            UIPasteboard.general.string = txt
-            activePasteSlot = slotId
-            UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
-            setStatus("📋 Slot #\(slotId) is now Active for Paste! Go to any app and tap Paste.", ok: true)
-        } else {
+    private func copySlotToIphoneClipboard(slotId: Int, alsoInsertInInputBox: Bool = false) {
+        let txt = slotPreviews[slotId] ?? store.decryptSlot(slotId) ?? dataManager.loadSlot(id: slotId)?.content ?? ""
+        guard !txt.isEmpty else {
             setStatus("Slot #\(slotId) is empty. Save text into Slot #\(slotId) first.", ok: false)
+            return
         }
+        activePasteSlot = slotId
+        UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
+        if alsoInsertInInputBox {
+            directInputText = txt
+        }
+        dataManager.syncPasteboardCarrier(activeSlotId: slotId, explicitActiveText: txt)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        setStatus("📋 Slot #\(slotId) (\"\(txt.prefix(24))\") is now Active in iPhone Clipboard — ready to Paste!", ok: true)
     }
 
-    /// Saves typed text (or a new external item from the iPhone Clipboard) into `slotId`.
     private func saveClipboardToSlot(slotId: Int) {
         let typed = directInputText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !typed.isEmpty {
@@ -980,16 +1135,8 @@ public struct ContentView: View {
         }
         if let clip = UIPasteboard.general.string, !clip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             saveTextToSlot(slotId: slotId, text: clip)
-        } else if let img = UIPasteboard.general.image, let pngData = img.pngData() {
-            let b64 = pngData.base64EncodedString()
-            let desc = "Image [\(Int(img.size.width))x\(Int(img.size.height))]"
-            _ = store.encryptAndStore(slot: slotId, text: desc)
-            _ = dataManager.saveSlot(id: slotId, content: desc, kind: "image", dataBase64: b64, mimeType: "image/png", byteSize: pngData.count)
-            UINotificationFeedbackGenerator().notificationOccurred(.success)
-            refreshSlots()
-            setStatus("✅ Saved iPhone Clipboard Image to Slot #\(slotId)!", ok: true)
         } else {
-            setStatus("Type text in the box above or copy text in another app first, then tap Save.", ok: false)
+            setStatus("Type text in the box in Section 2️⃣ first, then tap Save.", ok: false)
         }
     }
 
@@ -1001,6 +1148,7 @@ public struct ContentView: View {
             UserDefaults.standard.set(0, forKey: "ratt_active_paste_slot")
         }
         sendClearSlotToPc(slotId: slotId)
+        sendSlotToAndroidIfPaired(slotId: slotId, text: "")
         refreshSlots()
         setStatus("🗑️ Cleared Slot #\(slotId)", ok: true)
     }
@@ -1011,6 +1159,9 @@ public struct ContentView: View {
         activePasteSlot = 0
         UserDefaults.standard.set(0, forKey: "ratt_active_paste_slot")
         sendClearAllToPc()
+        for s in 1...10 {
+            sendSlotToAndroidIfPaired(slotId: s, text: "")
+        }
         refreshSlots()
         setStatus("🗑️ Cleared all 10 slots", ok: true)
     }
@@ -1028,40 +1179,89 @@ public struct ContentView: View {
         setStatus("🔒 All 10 slots securely wiped.", ok: true)
     }
 
-    private func handleCrossSync(target: String) {
-        if target == "Android" && !store.canSyncWithAndroid() {
-            upgradeReason = "UPGRADE REQUIRED: Cross-platform sync between iOS and Android is limited to Premium and Enterprise subscribers."
-            showUpgradeAlert = true
-            return
-        }
-        crossSyncTarget = target
-        showCrossSyncAlert = true
+    // ================= TWO-WAY WI-FI SYNC WITH RATT ANDROID (PORT 49210) =================
+
+    private func sendSlotToAndroidIfPaired(slotId: Int, text: String) {
+        guard !androidIpAddress.isEmpty else { return }
+        let token = dataManager.getOrCreateSyncToken()
+        guard let url = URL(string: "http://\(androidIpAddress):49210/sync_slot") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.timeoutInterval = 2.5
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(token, forHTTPHeaderField: "X-RATT-Token")
+        let payload: [String: Any] = [
+            "action": text.isEmpty ? "CLEAR_SLOT" : "SYNC_FROM_IOS",
+            "slot_id": slotId,
+            "content": text,
+            "timestamp": Date().timeIntervalSince1970,
+            "nonce": UUID().uuidString
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+        URLSession.shared.dataTask(with: req).resume()
     }
 
-    private func handleTranslate() {
-        if !store.canTranslate() {
-            upgradeReason = "UPGRADE REQUIRED: 9-Language Translation is limited to Premium and Enterprise subscribers."
-            showUpgradeAlert = true
-            return
+    private func syncWithAndroidDevice(targetIp: String, platformLabel: String, port: Int) {
+        setStatus("🔄 Connecting to \(platformLabel) (\(targetIp):\(port))...", ok: true)
+        let token = dataManager.getOrCreateSyncToken()
+
+        // 1. Push all filled iPhone slots to Android
+        var pushedCount = 0
+        for s in 1...10 {
+            if let text = slotPreviews[s] ?? store.decryptSlot(s), !text.isEmpty {
+                pushedCount += 1
+                if let url = URL(string: "http://\(targetIp):\(port)/sync_slot") {
+                    var req = URLRequest(url: url)
+                    req.httpMethod = "POST"
+                    req.timeoutInterval = 3.0
+                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    req.setValue(token, forHTTPHeaderField: "X-RATT-Token")
+                    let payload: [String: Any] = [
+                        "action": "SYNC_FROM_IOS",
+                        "slot_id": s,
+                        "content": text,
+                        "timestamp": Date().timeIntervalSince1970,
+                        "nonce": UUID().uuidString
+                    ]
+                    req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+                    URLSession.shared.dataTask(with: req).resume()
+                }
+            }
         }
-        setStatus("🌐 9-Language Translation Ready", ok: true)
+
+        // 2. Pull all filled Android slots into iPhone
+        guard let pullUrl = URL(string: "http://\(targetIp):\(port)/get_all_slots") else { return }
+        var pullReq = URLRequest(url: pullUrl)
+        pullReq.httpMethod = "GET"
+        pullReq.timeoutInterval = 3.5
+        pullReq.setValue(token, forHTTPHeaderField: "X-RATT-Token")
+        URLSession.shared.dataTask(with: pullReq) { data, resp, err in
+            if let err = err {
+                DispatchQueue.main.async {
+                    self.setStatus("⚠️ Could not reach \(platformLabel) at \(targetIp):\(port) (\(err.localizedDescription)). Ensure both phones are on the same Wi-Fi/Hotspot.", ok: false)
+                }
+                return
+            }
+            var pulledCount = 0
+            if let data = data,
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let slots = json["slots"] as? [String: String] {
+                for (k, v) in slots {
+                    if let sId = Int(k), (1...10).contains(sId), !v.isEmpty {
+                        _ = self.store.encryptAndStore(slot: sId, text: v)
+                        _ = self.dataManager.saveSlot(id: sId, content: v)
+                        pulledCount += 1
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                self.refreshSlots()
+                self.setStatus("✅ Synced with \(platformLabel) (\(targetIp)): Pushed \(pushedCount), Pulled \(pulledCount) slot(s)!", ok: true)
+            }
+        }.resume()
     }
 
-    private func handleShare() {
-        if !store.canShareAndMirror() {
-            upgradeReason = "UPGRADE REQUIRED: Account Sharing (copy/cut/paste across different RATT accounts) is limited to Premium and Enterprise subscribers."
-            showUpgradeAlert = true
-            return
-        }
-    }
-
-    private func handleMirror() {
-        if !store.canShareAndMirror() {
-            upgradeReason = "UPGRADE REQUIRED: Device Mirroring across RATT devices is limited to Premium and Enterprise subscribers."
-            showUpgradeAlert = true
-            return
-        }
-    }
+    // ================= TWO-WAY WI-FI SYNC WITH RATT PC (PORT 49211 / 49210) =================
 
     private func pairAndSyncWithPc(_ targetIp: String) {
         setStatus("🔗 Pairing with PC (\(targetIp))...", ok: true)
@@ -1128,35 +1328,10 @@ public struct ContentView: View {
                 }
                 DispatchQueue.main.async {
                     self.refreshSlots()
-                    self.setStatus("✅ Pulled \(pulled) slot(s) from PC! Tap any slot in Section 1️⃣ to choose which slot to paste.", ok: true)
+                    self.setStatus("✅ Pulled \(pulled) slot(s) from PC! Tap 'Choose Slot to Paste' to pick any slot.", ok: true)
                 }
             }.resume()
         }
-    }
-
-    private func performCrossSync(target: String, targetIp: String) {
-        guard !targetIp.isEmpty else { return }
-        let port = target == "Android" ? 49210 : 49211
-        let token = dataManager.getOrCreateSyncToken()
-        for s in 1...10 {
-            let text = store.decryptSlot(s) ?? ""
-            guard let url = URL(string: "http://\(targetIp):\(port)/sync_slot") else { continue }
-            var req = URLRequest(url: url)
-            req.httpMethod = "POST"
-            req.timeoutInterval = 2.5
-            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            req.setValue(token, forHTTPHeaderField: "X-RATT-Token")
-            let payload: [String: Any] = [
-                "action": text.isEmpty ? "CLEAR_SLOT" : "SYNC_FROM_IOS",
-                "slot_id": s,
-                "content": text,
-                "ts": Date().timeIntervalSince1970,
-                "nonce": UUID().uuidString
-            ]
-            req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-            URLSession.shared.dataTask(with: req).resume()
-        }
-        setStatus("🔄 Synced slots with \(target) (\(targetIp))", ok: true)
     }
 
     private func sendSlotToPc(slotId: Int, text: String) {

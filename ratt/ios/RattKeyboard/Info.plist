@@ -18,6 +18,13 @@
     <string>2.0.0</string>
     <key>CFBundleVersion</key>
     <string>2</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSAllowsArbitraryLoads</key>
+        <true/>
+        <key>NSAllowsLocalNetworking</key>
+        <true/>
+    </dict>
     <key>NSExtension</key>
     <dict>
         <key>NSExtensionAttributes</key>
