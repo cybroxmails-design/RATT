@@ -5,11 +5,12 @@ on:
     branches: [ "main", "master" ]
     paths:
       - 'ratt/ios/**'
+      - '.github/workflows/build-ios.yml'
   workflow_dispatch:
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: macos-15-intel
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
