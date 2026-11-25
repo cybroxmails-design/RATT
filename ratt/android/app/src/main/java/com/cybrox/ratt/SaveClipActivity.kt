@@ -62,6 +62,20 @@ class SaveClipActivity : Activity() {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
         val clipData = clipboard?.primaryClip
 
+        // AND-02: Respect Android 13+ EXTRA_IS_SENSITIVE flag for passwords/OTPs
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            val isSensitive = clipData?.description?.extras?.getBoolean(
+                android.content.ClipDescription.EXTRA_IS_SENSITIVE,
+                false
+            ) == true
+            if (isSensitive) {
+                isProcessed = true
+                Toast.makeText(this, "Sensitive clipboard content (password/OTP) is protected and not synced.", Toast.LENGTH_SHORT).show()
+                finish()
+                return
+            }
+        }
+
         if (clipData != null && clipData.itemCount > 0) {
             val item = clipData.getItemAt(0)
             val uri = item.uri

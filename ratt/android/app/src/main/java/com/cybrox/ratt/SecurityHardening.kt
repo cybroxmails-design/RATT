@@ -193,11 +193,17 @@ object SecurityHardening {
         return false
     }
 
+    // AND-03: Pinned Cybrox release signing certificate SHA-256 fingerprint (hex).
+    // Replace with the production Play App Signing SHA-256 fingerprint before release.
+    private const val PINNED_RELEASE_CERT_SHA256 = "REPLACE_WITH_PRODUCTION_CYBROX_APK_SHA256_HEX"
+
     /**
-     * 6. Verify that the APK is signed and its signing certificate SHA-256 digest is non-empty.
+     * 6. Verify that the APK is signed by the pinned Cybrox release certificate (AND-03).
+     * Debuggable local builds pass during development; release builds fail closed on mismatch.
      */
     fun hasValidApkSignature(context: Context): Boolean {
         return try {
+            val isDebuggable = (context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
             val pm = context.packageManager
             val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 val pkgInfo = pm.getPackageInfo(context.packageName, PackageManager.GET_SIGNING_CERTIFICATES)
@@ -211,7 +217,13 @@ object SecurityHardening {
             if (signatures.isNullOrEmpty()) return false
             val md = MessageDigest.getInstance("SHA-256")
             val digest = md.digest(signatures[0].toByteArray())
-            digest.size == 32
+            if (digest.size != 32) return false
+            if (isDebuggable) return true
+            val actualHex = digest.joinToString("") { "%02x".format(it) }
+            MessageDigest.isEqual(
+                actualHex.toByteArray(Charsets.US_ASCII),
+                PINNED_RELEASE_CERT_SHA256.lowercase().toByteArray(Charsets.US_ASCII)
+            )
         } catch (_: Exception) {
             false
         }

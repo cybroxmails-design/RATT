@@ -403,9 +403,11 @@ static BOOL valid_menu_args(const wchar_t *wargs)
 static BOOL valid_launcher_path(const wchar_t *launcher, const wchar_t *prefix)
 {
     if (!launcher || !launcher[0]) return FALSE;
+    /* Block UNC paths, device namespaces, relative paths, and traversal tokens (WIN-02) */
     if (launcher[0] == L'\\' && launcher[1] == L'\\') return FALSE;
-    if (wcspbrk(launcher, L"&|;`$><\r\n")) return FALSE;
-    if (prefix && wcspbrk(prefix, L"&|;`$><\r\n")) return FALSE;
+    if (wcsstr(launcher, L"..") != NULL) return FALSE;
+    if (wcspbrk(launcher, L"&|;`$><\r\n\"'") != NULL) return FALSE;
+    if (prefix && (wcsstr(prefix, L"..") != NULL || wcspbrk(prefix, L"&|;`$><\r\n") != NULL)) return FALSE;
     return TRUE;
 }
 
@@ -455,28 +457,68 @@ static HRESULT STDMETHODCALLTYPE CM_Invoke(IContextMenu *This, CMINVOKECOMMANDIN
     if ((int)idx >= e->nargs || !e->args[idx] || e->launcher[0] == 0) return E_INVALIDARG;
     if (!valid_menu_args(e->args[idx]) || !valid_launcher_path(e->launcher, e->prefix)) return E_INVALIDARG;
 
-    /* SEC-R002-02: Defensive path validation when installed in Program Files */
-    wchar_t trusted_dir[MAX_PATH];
-    if (g_module && GetModuleFileNameW(g_module, trusted_dir, MAX_PATH) > 0) {
-        wchar_t *slash = wcsrchr(trusted_dir, L'\\');
-        if (slash) *(slash + 1) = 0;
-        wchar_t prog_files[MAX_PATH];
-        DWORD pf_len = GetEnvironmentVariableW(L"ProgramFiles", prog_files, MAX_PATH);
-        if (pf_len > 0 && pf_len < MAX_PATH && _wcsnicmp(trusted_dir, prog_files, pf_len) == 0) {
-            if (_wcsnicmp(e->launcher, trusted_dir, wcslen(trusted_dir)) != 0) {
-                return E_ACCESSDENIED; /* Refuses execution of untrusted paths from AppData */
+    /* WIN-02: Canonicalize launcher via GetFullPathNameW and verify it resides in the
+     * DLL's own trusted installation directory (or Program Files\RATT), never arbitrary AppData */
+    wchar_t canon_launcher[MAX_PATH * 2];
+    DWORD clen = GetFullPathNameW(e->launcher, MAX_PATH * 2, canon_launcher, NULL);
+    if (clen == 0 || clen >= MAX_PATH * 2) return E_ACCESSDENIED;
+    if (canon_launcher[0] == L'\\' && canon_launcher[1] == L'\\') return E_ACCESSDENIED;
+
+    wchar_t trusted_dir[MAX_PATH * 2];
+    if (!g_module || GetModuleFileNameW(g_module, trusted_dir, MAX_PATH * 2) == 0) {
+        return E_ACCESSDENIED;
+    }
+    wchar_t *slash = wcsrchr(trusted_dir, L'\\');
+    if (!slash) return E_ACCESSDENIED;
+    *(slash + 1) = 0;
+
+    /* Allow launcher strictly inside the DLL's own directory (or parent dir when DLL is in assets\) */
+    BOOL trusted = (_wcsnicmp(canon_launcher, trusted_dir, wcslen(trusted_dir)) == 0);
+    if (!trusted) {
+        wchar_t parent_dir[MAX_PATH * 2];
+        wcsncpy(parent_dir, trusted_dir, MAX_PATH * 2 - 1);
+        parent_dir[MAX_PATH * 2 - 1] = 0;
+        size_t plen = wcslen(parent_dir);
+        if (plen > 1) {
+            parent_dir[plen - 1] = 0; /* strip trailing backslash */
+            wchar_t *pslash = wcsrchr(parent_dir, L'\\');
+            if (pslash) {
+                *(pslash + 1) = 0;
+                if (_wcsnicmp(canon_launcher, parent_dir, wcslen(parent_dir)) == 0) {
+                    trusted = TRUE;
+                }
             }
         }
+    }
+    /* Restrict executable basename to RATT.exe only */
+    const wchar_t *lbase = wcsrchr(canon_launcher, L'\\');
+    lbase = lbase ? (lbase + 1) : canon_launcher;
+    if (!trusted || _wcsicmp(lbase, L"RATT.exe") != 0) {
+        return E_ACCESSDENIED;
     }
 
     write_shell_context(e);
     if (send_to_helper(e->args[idx])) return S_OK;
 
-    wchar_t params[MAX_PATH * 2 + 128];
-    _snwprintf(params, sizeof(params) / sizeof(params[0]) - 1, L"%ls %ls", e->prefix, e->args[idx]);
-    params[sizeof(params) / sizeof(params[0]) - 1] = 0;
-    HINSTANCE r = ShellExecuteW(ici->hwnd, L"open", e->launcher, params, NULL, SW_HIDE);
-    return ((INT_PTR)r > 32) ? S_OK : E_FAIL;
+    /* WIN-02: Use CreateProcessW with explicit lpApplicationName instead of ShellExecuteW */
+    wchar_t cmdline[MAX_PATH * 2 + 192];
+    _snwprintf(cmdline, sizeof(cmdline) / sizeof(cmdline[0]) - 1, L"\"%ls\" %ls", canon_launcher, e->args[idx]);
+    cmdline[sizeof(cmdline) / sizeof(cmdline[0]) - 1] = 0;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    memset(&si, 0, sizeof(si));
+    memset(&pi, 0, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    BOOL ok = CreateProcessW(canon_launcher, cmdline, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
+    if (ok) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return S_OK;
+    }
+    return E_FAIL;
 }
 
 static HRESULT STDMETHODCALLTYPE CM_GetCommandString(IContextMenu *This, UINT_PTR id, UINT type,

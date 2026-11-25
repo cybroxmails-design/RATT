@@ -33,8 +33,11 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Set, Tuple
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
 
 MAX_PACKET_AGE_SECONDS = 60.0
+MAX_DECOMPRESSED_BYTES = 10 * 1024 * 1024  # 10 MB decompression bomb cap (COM-04)
 
 
 class SecurityIntegrityError(Exception):
@@ -84,12 +87,17 @@ class E2EESecurityChannel:
     """Manages symmetric key derivation, encryption, and verification between paired devices."""
 
     def __init__(self, shared_secret: bytes, mailbox_id: str):
-        # Derive 256-bit AES key via SHA-256
-        self.key = hashlib.sha256(shared_secret).digest()
+        # COM-03: Derive 256-bit AES key via HKDF-SHA256 bound to mailbox_id context
+        self.key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=b"RATT-E2EE-HKDF-SALT-V2",
+            info=f"ratt-channel:{mailbox_id}".encode("utf-8"),
+        ).derive(shared_secret)
         self.mailbox_id = mailbox_id
         self._aesgcm = AESGCM(self.key)
         self._send_counter = 0
-        self._consumed_nonces: Set[str] = set()
+        self._consumed_nonces: collections.OrderedDict = collections.OrderedDict()
         self._lock = threading.Lock()
 
     def pack(self, payload: Dict[str, Any]) -> EncryptedEnvelope:
@@ -126,14 +134,18 @@ class E2EESecurityChannel:
         if abs(now - envelope.timestamp) > MAX_PACKET_AGE_SECONDS:
             raise ReplayAttackError(f"Packet expired: age {now - envelope.timestamp:.1f}s exceeds {MAX_PACKET_AGE_SECONDS}s TTL")
 
-        # 2. Anti-Replay: Check Nonce reuse
+        # 2. Anti-Replay: Check Nonce reuse with timestamp-based eviction (COM-04)
         with self._lock:
+            # Evict ONLY expired nonces so active replay window is never reopened
+            while self._consumed_nonces:
+                oldest_nonce, oldest_ts = next(iter(self._consumed_nonces.items()))
+                if now - oldest_ts > MAX_PACKET_AGE_SECONDS:
+                    self._consumed_nonces.popitem(last=False)
+                else:
+                    break
             if envelope.nonce_b64 in self._consumed_nonces:
                 raise ReplayAttackError("Replay attack detected: Nonce has already been consumed")
-            self._consumed_nonces.add(envelope.nonce_b64)
-            # Cap consumed nonces cache to prevent memory buildup
-            if len(self._consumed_nonces) > 5000:
-                self._consumed_nonces.clear()
+            self._consumed_nonces[envelope.nonce_b64] = now
 
         # 3. Authenticate and Decrypt with AES-GCM
         nonce = base64.b64decode(envelope.nonce_b64)
@@ -145,10 +157,15 @@ class E2EESecurityChannel:
         except Exception as e:
             raise SecurityIntegrityError(f"Cryptographic authentication failed! Packet tampered or invalid key: {e}")
 
-        # Seamless support for compressed envelopes and legacy uncompressed payloads
+        # COM-04: Bounded zlib decompression to prevent zip-bomb memory exhaustion DoS
         try:
-            decompressed = zlib.decompress(plaintext)
+            decomp = zlib.decompressobj()
+            decompressed = decomp.decompress(plaintext, MAX_DECOMPRESSED_BYTES)
+            if decomp.unconsumed_tail:
+                raise SecurityIntegrityError("Decompressed payload exceeds maximum allowed size")
             return json.loads(decompressed.decode("utf-8"))
+        except SecurityIntegrityError:
+            raise
         except Exception:
             return json.loads(plaintext.decode("utf-8"))
 
@@ -232,15 +249,20 @@ class DualTransportRouter:
         """Route slot sync packet: Local Wi-Fi socket first, E2EE relay second."""
         port = self.local_port_ios if is_ios else self.local_port_android
 
-        # 1. Attempt Local Wi-Fi direct connection if target IP is provided
+        # 1. Attempt Local Wi-Fi direct connection if target IP is provided (encrypted when E2EE channel exists - COM-01)
         if target_ip and target_ip not in ("0.0.0.0", ""):
             try:
-                packet = json.dumps({"slot": slot_num, "text": text}) + "\n"
+                if target_device_id and target_device_id in self._security_channels:
+                    channel = self._security_channels[target_device_id]
+                    env = channel.pack({"slot": slot_num, "text": text, "action": "copy"})
+                    packet = env.to_json() + "\n"
+                else:
+                    return False, "SYNC_FAILED: Refusing unencrypted local sync without registered E2EE channel"
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                     s.settimeout(0.8)
                     s.connect((target_ip, port))
                     s.sendall(packet.encode("utf-8"))
-                return True, f"DIRECT_LOCAL: Synced to {target_ip}:{port} over local network"
+                return True, f"DIRECT_LOCAL_E2EE: Synced encrypted to {target_ip}:{port} over local network"
             except Exception:
                 pass  # Fallback to Remote Relay
 
@@ -264,10 +286,11 @@ def get_default_relay() -> EphemeralRelayMailbox:
     return _GLOBAL_RELAY
 
 
-def derive_share_secret(code: str) -> bytes:
-    """Derive 256-bit AES-GCM key from Short Authentication Code (SAS)."""
+def derive_share_secret(code: str, salt: Optional[bytes] = None) -> bytes:
+    """Derive 256-bit AES-GCM key from Short Authentication Code (SAS) using OWASP-compliant 600k PBKDF2-SHA256 (COM-03)."""
     normalized = (code or "").strip().upper().replace(" ", "").replace("-", "")
-    return hashlib.pbkdf2_hmac("sha256", normalized.encode("utf-8"), b"RATT_METHOD3_SAS_SALT", 10000, 32)
+    effective_salt = salt if (salt and len(salt) >= 16) else b"RATT_METHOD3_SAS_SALT_V2:" + normalized.encode("utf-8")
+    return hashlib.pbkdf2_hmac("sha256", normalized.encode("utf-8"), effective_salt, 600_000, 32)
 
 
 def share_slots_e2ee(

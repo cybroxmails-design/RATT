@@ -39,8 +39,25 @@ static BOOL ensure_accessibility_permissions(void) {
     return AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts);
 }
 
-/* Inject Cmd+C, Cmd+X, or Cmd+V into the frontmost macOS application via Quartz */
+static void register_cmd_hotkeys(void) {
+    EventHotKeyID h1 = { 'RATT', 1 }, h2 = { 'RATT', 2 }, h3 = { 'RATT', 3 };
+    if (!g_cmd_hotkeys[0]) RegisterEventHotKey(kVK_ANSI_C, cmdKey, h1, GetApplicationEventTarget(), 0, &g_cmd_hotkeys[0]);
+    if (!g_cmd_hotkeys[1]) RegisterEventHotKey(kVK_ANSI_X, cmdKey, h2, GetApplicationEventTarget(), 0, &g_cmd_hotkeys[1]);
+    if (!g_cmd_hotkeys[2]) RegisterEventHotKey(kVK_ANSI_V, cmdKey, h3, GetApplicationEventTarget(), 0, &g_cmd_hotkeys[2]);
+}
+
+static void unregister_cmd_hotkeys(void) {
+    for (int i = 0; i < 3; i++) {
+        if (g_cmd_hotkeys[i]) {
+            UnregisterEventHotKey(g_cmd_hotkeys[i]);
+            g_cmd_hotkeys[i] = NULL;
+        }
+    }
+}
+
+/* MAC-02: Pause Cmd hotkeys around CGEventPost to prevent recursive hotkey re-triggering */
 static void inject_command_key(CGKeyCode keycode) {
+    unregister_cmd_hotkeys();
     CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     CGEventRef down = CGEventCreateKeyboardEvent(src, keycode, true);
     CGEventRef up = CGEventCreateKeyboardEvent(src, keycode, false);
@@ -53,6 +70,12 @@ static void inject_command_key(CGKeyCode keycode) {
     if (down) CFRelease(down);
     if (up) CFRelease(up);
     if (src) CFRelease(src);
+    if (g_enabled) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            if (g_enabled) register_cmd_hotkeys();
+        });
+    }
 }
 
 static void unarm_digits(void) {
@@ -114,6 +137,15 @@ static OSStatus hotkey_handler(EventHandlerCallRef next, EventRef event, void *u
         arm_digits('x');
     } else if (hid.id == 3) { /* Cmd+V */
         arm_digits('v');
+        /* MAC-02: Forward ordinary Cmd+V if no slot digit is pressed within 1000ms */
+        UInt64 armed_ts = g_armed_at_ms;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            if (g_armed_op == 'v' && g_armed_at_ms == armed_ts) {
+                unarm_digits();
+                inject_command_key(kVK_ANSI_V);
+            }
+        });
     } else if (hid.id >= 100 && hid.id <= 109) {
         int digit = (int)(hid.id - 100);
         int slot = (digit == 0) ? 10 : digit;
@@ -139,12 +171,11 @@ int main(int argc, const char *argv[]) {
         EventTypeSpec spec = { kEventClassKeyboard, kEventHotKeyPressed };
         InstallApplicationEventHandler(&hotkey_handler, 1, &spec, NULL, NULL);
 
-        EventHotKeyID id_c = { 'RATT', 1 };
-        EventHotKeyID id_x = { 'RATT', 2 };
-        EventHotKeyID id_v = { 'RATT', 3 };
-        RegisterEventHotKey(kVK_ANSI_C, cmdKey, id_c, GetApplicationEventTarget(), 0, &g_cmd_hotkeys[0]);
-        RegisterEventHotKey(kVK_ANSI_X, cmdKey, id_x, GetApplicationEventTarget(), 0, &g_cmd_hotkeys[1]);
-        RegisterEventHotKey(kVK_ANSI_V, cmdKey, id_v, GetApplicationEventTarget(), 0, &g_cmd_hotkeys[2]);
+        register_cmd_hotkeys();
+        /* MAC-02: Register Ctrl+Option+P emergency toggle hotkey (id 5) */
+        EventHotKeyID id_toggle = { 'RATT', 5 };
+        RegisterEventHotKey(kVK_ANSI_P, controlKey | optionKey, id_toggle,
+                            GetApplicationEventTarget(), 0, &g_toggle_hotkey);
 
         [[NSApplication sharedApplication] run];
     }

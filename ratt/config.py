@@ -62,7 +62,9 @@ def validate_user_name(name: str) -> Tuple[bool, str]:
     return True, cleaned
 
 # Ed25519 public key used to verify cloud-issued subscription tokens
-CYBROX_PUBLIC_KEY = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+# (Placeholder empty-string SHA-256 is explicitly rejected until a real production key is provisioned.)
+_PLACEHOLDER_PUBLIC_KEY = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+CYBROX_PUBLIC_KEY = os.environ.get("RATT_LICENSE_PUBLIC_KEY", _PLACEHOLDER_PUBLIC_KEY)
 
 # Brute-force login protection (in-memory per-account attempt tracker)
 _LOGIN_MAX_ATTEMPTS = 5
@@ -82,15 +84,34 @@ def open_cybrox_web(url: str = CYBROX_ACCOUNT_URL) -> bool:
         return False
 
 
-def load_verified_license(token_b64: str) -> dict:
-    """Verify an Ed25519-signed license token from the Cybrox Cloud service."""
+def load_verified_license(token_b64: str, public_key_hex: Optional[str] = None) -> dict:
+    """Verify an Ed25519-signed license token from the Cybrox Cloud service (COM-03).
+
+    Accepts a Base64-encoded payload consisting of `64-byte Ed25519 signature + UTF-8 JSON`
+    and verifies it using `cryptography` (or `PyNaCl` if available). Explicitly rejects
+    the placeholder SHA-256("") key.
+    """
+    fallback = {"tier": "basic", "premium_slots": 0, "expires_at": None}
+    key_hex = (public_key_hex or CYBROX_PUBLIC_KEY or "").strip().lower()
+    if not key_hex or key_hex == _PLACEHOLDER_PUBLIC_KEY or len(key_hex) != 64:
+        return fallback
     try:
-        import nacl.signing
-        verify_key = nacl.signing.VerifyKey(bytes.fromhex(CYBROX_PUBLIC_KEY))
-        data = verify_key.verify(base64.b64decode(token_b64.encode("ascii")))
-        return json.loads(data.decode("utf-8"))
+        raw_key = bytes.fromhex(key_hex)
+        signed_blob = base64.b64decode(token_b64.encode("ascii"))
+        if len(signed_blob) <= 64:
+            return fallback
+        sig, msg = signed_blob[:64], signed_blob[64:]
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+            Ed25519PublicKey.from_public_bytes(raw_key).verify(sig, msg)
+            data = json.loads(msg.decode("utf-8"))
+        except ImportError:
+            import nacl.signing
+            verify_key = nacl.signing.VerifyKey(raw_key)
+            data = json.loads(verify_key.verify(signed_blob).decode("utf-8"))
+        return data if isinstance(data, dict) else fallback
     except Exception:
-        return {"tier": "basic", "premium_slots": 2, "expires_at": None}
+        return fallback
 
 
 def _atomic_write_json(path: str, payload: dict) -> None:
@@ -296,13 +317,39 @@ class AppConfig:
         os.makedirs(d, exist_ok=True)
         return d
 
-    @staticmethod
-    def _dpapi_protect(raw: bytes) -> bytes:
-        """Encrypt bytes using Windows DPAPI (with CRYPTPROTECT_UI_FORBIDDEN) bound to the current OS user."""
+    @classmethod
+    def _posix_local_key(cls) -> bytes:
+        """Per-user 256-bit AES-GCM key stored with 0600 permissions for non-Windows hosts (COM-03)."""
+        kpath = os.path.join(cls._appdata_dir(), ".local_enc_key")
+        if os.path.exists(kpath):
+            try:
+                with open(kpath, "rb") as f:
+                    k = f.read()
+                if len(k) == 32:
+                    return k
+            except OSError:
+                pass
+        k = secrets.token_bytes(32)
+        try:
+            fd = os.open(kpath, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(k)
+        except OSError:
+            pass
+        return k
+
+    @classmethod
+    def _dpapi_protect(cls, raw: bytes) -> bytes:
+        """Encrypt bytes using Windows DPAPI (or AES-256-GCM on POSIX; never silent plaintext) (COM-03)."""
         if not raw:
             return b""
         if os.name != "nt":
-            return raw
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                nonce = secrets.token_bytes(12)
+                return b"RATTGCM1" + nonce + AESGCM(cls._posix_local_key()).encrypt(nonce, raw, b"RATT-POSIX-ATREST")
+            except Exception:
+                return b""
         try:
             class DATA_BLOB(ctypes.Structure):
                 _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
@@ -331,13 +378,19 @@ class AppConfig:
             pass
         return b""
 
-    @staticmethod
-    def _dpapi_unprotect(enc: bytes) -> Optional[bytes]:
-        """Decrypt bytes protected with Windows DPAPI. Returns None on tamper or failure."""
+    @classmethod
+    def _dpapi_unprotect(cls, enc: bytes) -> Optional[bytes]:
+        """Decrypt bytes protected with Windows DPAPI (or POSIX AES-256-GCM). Returns None on tamper/failure."""
         if not enc:
             return None
         if os.name != "nt":
-            return enc
+            if enc.startswith(b"RATTGCM1") and len(enc) > 20:
+                try:
+                    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                    return AESGCM(cls._posix_local_key()).decrypt(enc[8:20], enc[20:], b"RATT-POSIX-ATREST")
+                except Exception:
+                    return None
+            return None
         try:
             class DATA_BLOB(ctypes.Structure):
                 _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
@@ -523,10 +576,10 @@ class AppConfig:
         accounts = self._load_accounts()
         acct = accounts.get(norm)
         if not acct:
-            # Equalize response timing to prevent email enumeration
+            # Equalize response timing and use identical error message to prevent email enumeration (COM-07)
             self.hash_password(password or "invalid", _DUMMY_SALT)
             _login_failures.setdefault(norm, []).append(now)
-            return False, "No account found for this email. Please sign up on the Cybrox website first."
+            return False, "Incorrect email or password."
 
         salt = acct.get("password_salt", "")
         pw_hash = acct.get("password_hash", "")

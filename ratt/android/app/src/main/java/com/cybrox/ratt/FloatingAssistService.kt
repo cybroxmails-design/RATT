@@ -209,8 +209,17 @@ class FloatingAssistService : Service() {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager ?: return
         clipListener = android.content.ClipboardManager.OnPrimaryClipChangedListener {
             try {
-                val clip = clipboard.primaryClip
-                val text = clip?.getItemAt(0)?.text?.toString().orEmpty()
+                val clip = clipboard.primaryClip ?: return@OnPrimaryClipChangedListener
+                // AND-02: Never auto-capture or sync sensitive clipboard items (passwords, OTPs, banking apps)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    val isSensitive = clip.description?.extras?.getBoolean(
+                        android.content.ClipDescription.EXTRA_IS_SENSITIVE,
+                        false
+                    ) == true
+                    if (isSensitive) return@OnPrimaryClipChangedListener
+                }
+                val rawText = clip.getItemAt(0)?.text?.toString().orEmpty()
+                val text = SlotRepository.sanitizeIncomingText(rawText) ?: return@OnPrimaryClipChangedListener
                 if (text.isNotBlank() && text != MainActivity.lastCopiedText) {
                     MainActivity.lastCopiedText = text
                     SlotRepository.put(1, text)

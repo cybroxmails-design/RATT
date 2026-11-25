@@ -27,8 +27,12 @@
  * Build:  gcc -shared -O2 -s -municode -static -o ratt_daemon.dll ratt_daemon.c -luser32 -ladvapi32
  */
 #define WIN32_LEAN_AND_MEAN
+#define COBJMACROS
 #define _WIN32_WINNT 0x0601
 #include <windows.h>
+#include <ole2.h>
+#include <oleauto.h>
+#include <shlobj.h>
 #include <sddl.h>
 #include <ctype.h>
 #include <stdarg.h>
@@ -110,6 +114,14 @@ static void log_line(const char *fmt, ...)
 
 /* ---------- events to the app ---------- */
 
+typedef void (CALLBACK *EventCallbackFn)(const char *line);
+static EventCallbackFn g_event_cb = NULL;
+
+__declspec(dllexport) void CALLBACK SetEventCallback(EventCallbackFn cb)
+{
+    g_event_cb = cb;
+}
+
 static void write_event(const char *line)
 {
     char buf[80];
@@ -124,9 +136,12 @@ static void write_event(const char *line)
 static void emit(const char *line)
 {
     if (g_dry_run) log_line("EVENT %s", line);
+    if (g_event_cb) {
+        g_event_cb(line);
+    }
     if (g_pipe != INVALID_HANDLE_VALUE) {
         write_event(line);
-    } else if (g_queued < EVENT_QUEUE) {
+    } else if (!g_event_cb && g_queued < EVENT_QUEUE) {
         snprintf(g_queue[g_queued++], sizeof(g_queue[0]), "%s", line);
     }
 }
@@ -227,14 +242,13 @@ static void inject(WORD vk, int with_ctrl)
     g_rearm_pending = 1;
     apply_hotkeys();
 
-    INPUT in[4];
+    INPUT in[6];
     int n = 0;
     int ctrl_already_down = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
-    int press_ctrl = with_ctrl && !ctrl_already_down;   /* never release a Ctrl the user holds */
-    if (press_ctrl) key_event(in, &n, VK_CONTROL, 0);
+    if (with_ctrl) key_event(in, &n, VK_CONTROL, 0);
     key_event(in, &n, vk, 0);
     key_event(in, &n, vk, 1);
-    if (press_ctrl) key_event(in, &n, VK_CONTROL, 1);
+    if (with_ctrl && (!ctrl_already_down || vk == 'V')) key_event(in, &n, VK_CONTROL, 1);
     SendInput((UINT)n, in, sizeof(INPUT));
 
     SetTimer(g_wnd, TIMER_REARM, 120, NULL);
@@ -332,7 +346,7 @@ static void on_digit(int d)
 static int valid_token(const char *t)
 {
     size_t n = strlen(t);
-    if (n == 0 || n > 10) return 0;
+    if (n == 0 || n > 15) return 0;
     for (size_t i = 0; i < n; i++)
         if (!(isalnum((unsigned char)t[i]) || t[i] == '-')) return 0;
     return 1;
@@ -340,7 +354,11 @@ static int valid_token(const char *t)
 
 static int valid_action(const char *a)
 {
-    static const char *ok[] = { "open", "copy", "cut", "paste", "translate", "share", "mirror", "popup" };
+    static const char *ok[] = {
+        "open", "copy", "cut", "paste", "translate", "share", "mirror", "popup",
+        "android", "android-copy", "android-cut", "android-paste",
+        "ios", "ios-copy", "ios-cut", "ios-paste"
+    };
     for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
         if (strcmp(a, ok[i]) == 0) return 1;
     return 0;
@@ -473,9 +491,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         HWND hSender = (HWND)w;
         DWORD sender_pid = 0;
         if (hSender) GetWindowThreadProcessId(hSender, &sender_pid);
-        int from_parent = g_dry_run || (sender_pid != 0 && sender_pid == g_parent_pid);
-        /* SEC-R002-04: Validate sender PID matches authorized parent process or Explorer */
-        if (!from_parent && !is_authorized_explorer(sender_pid)) return FALSE;
+        int from_parent = g_dry_run || (sender_pid != 0 && sender_pid == g_parent_pid) || (g_event_cb != NULL && sender_pid == GetCurrentProcessId());
         COPYDATASTRUCT *cd = (COPYDATASTRUCT *)l;
         if (!cd || cd->dwData != COPYDATA_MAGIC || !cd->lpData || cd->cbData == 0 || cd->cbData > 65536)
             return FALSE;
@@ -483,6 +499,11 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM w, LPARAM l)
         if (!text) return FALSE;
         memcpy(text, cd->lpData, cd->cbData);
         text[cd->cbData] = 0;
+        /* Privileged STATE/KEYS/QUIT commands require from_parent; ACTION/SHOW are strictly token-whitelisted */
+        if (!from_parent && strncmp(text, "ACTION ", 7) != 0 && strcmp(text, "SHOW") != 0 && !is_authorized_explorer(sender_pid)) {
+            free(text);
+            return FALSE;
+        }
         handle_command(text, from_parent);
         free(text);
         return TRUE;
@@ -564,7 +585,197 @@ static int tokenize(wchar_t *cmd, wchar_t **argv, int max)
     return n;
 }
 
-/* ---------- entry points (hosted by rundll32.exe) ---------- */
+/* ---------- Explorer folder & file selection introspection (COM IDispatch) ---------- */
+
+static HRESULT disp_invoke(IDispatch *disp, LPCOLESTR name, WORD flags, VARIANT *arg, VARIANT *ret)
+{
+    if (!disp || !ret) return E_INVALIDARG;
+    VariantInit(ret);
+    DISPID dispid = 0;
+    LPOLESTR names[1] = { (LPOLESTR)name };
+    HRESULT hr = IDispatch_GetIDsOfNames(disp, &IID_NULL, names, 1, LOCALE_USER_DEFAULT, &dispid);
+    if (FAILED(hr)) return hr;
+    DISPPARAMS dp = { arg, NULL, arg ? 1 : 0, 0 };
+    return IDispatch_Invoke(disp, dispid, &IID_NULL, LOCALE_USER_DEFAULT, flags, &dp, ret, NULL, NULL);
+}
+
+static IDispatch *disp_get_obj(IDispatch *disp, LPCOLESTR name, VARIANT *arg)
+{
+    VARIANT v;
+    if (SUCCEEDED(disp_invoke(disp, name, DISPATCH_PROPERTYGET | DISPATCH_METHOD, arg, &v))) {
+        if (v.vt == VT_DISPATCH && v.pdispVal) return v.pdispVal;
+        VariantClear(&v);
+    }
+    return NULL;
+}
+
+static long disp_get_long(IDispatch *disp, LPCOLESTR name, long def_val)
+{
+    VARIANT v;
+    if (SUCCEEDED(disp_invoke(disp, name, DISPATCH_PROPERTYGET, NULL, &v))) {
+        VARIANT conv;
+        VariantInit(&conv);
+        long res = def_val;
+        if (SUCCEEDED(VariantChangeType(&conv, &v, 0, VT_I4))) res = conv.lVal;
+        VariantClear(&conv);
+        VariantClear(&v);
+        return res;
+    }
+    return def_val;
+}
+
+static BOOL disp_get_bstr(IDispatch *disp, LPCOLESTR name, wchar_t *out, size_t max_cch)
+{
+    out[0] = 0;
+    VARIANT v;
+    if (SUCCEEDED(disp_invoke(disp, name, DISPATCH_PROPERTYGET, NULL, &v))) {
+        BOOL ok = FALSE;
+        if (v.vt == VT_BSTR && v.bstrVal && v.bstrVal[0]) {
+            wcsncpy(out, v.bstrVal, max_cch - 1);
+            out[max_cch - 1] = 0;
+            ok = TRUE;
+        }
+        VariantClear(&v);
+        return ok;
+    }
+    return FALSE;
+}
+
+static void append_line(wchar_t *out_buf, int max_chars, const wchar_t *prefix, const wchar_t *val)
+{
+    if (!val || !val[0]) return;
+    size_t cur = wcslen(out_buf);
+    size_t need = wcslen(prefix) + wcslen(val) + 2;
+    if ((int)(cur + need) >= max_chars) return;
+    wcscat(out_buf, prefix);
+    wcscat(out_buf, val);
+    wcscat(out_buf, L"\n");
+}
+
+__declspec(dllexport) int WINAPI GetExplorerSelectionW(HWND target_hwnd, wchar_t *out_buf, int max_chars)
+{
+    if (!out_buf || max_chars <= 16) return 0;
+    out_buf[0] = 0;
+
+    HWND fg = target_hwnd ? target_hwnd : GetForegroundWindow();
+    wchar_t cls[64] = {0};
+    if (fg) GetClassNameW(fg, cls, 63);
+
+    /* If the user is on the Windows Desktop, return the Desktop folder path */
+    if (_wcsicmp(cls, L"Progman") == 0 || _wcsicmp(cls, L"WorkerW") == 0) {
+        wchar_t desk[MAX_PATH] = {0};
+        if (SUCCEEDED(SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL, 0, desk)) && desk[0]) {
+            append_line(out_buf, max_chars, L"FOLDER\t", desk);
+            return 1;
+        }
+    }
+
+    int is_explorer = (_wcsicmp(cls, L"CabinetWClass") == 0 || _wcsicmp(cls, L"ExploreWClass") == 0);
+    if (target_hwnd != NULL && !is_explorer) {
+        return 0;
+    }
+
+    HRESULT hr_init = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    CLSID clsid;
+    IDispatch *pShell = NULL;
+    if (SUCCEEDED(CLSIDFromProgID(L"Shell.Application", &clsid)) &&
+        SUCCEEDED(CoCreateInstance(&clsid, NULL, CLSCTX_INPROC_SERVER | CLSCTX_LOCAL_SERVER,
+                                   &IID_IDispatch, (void **)&pShell)) && pShell) {
+        IDispatch *pWins = disp_get_obj(pShell, L"Windows", NULL);
+        if (pWins) {
+            long count = disp_get_long(pWins, L"Count", 0);
+            IDispatch *matchedWin = NULL;
+            IDispatch *titleMatchedWin = NULL;
+            IDispatch *fallbackWin = NULL;
+            wchar_t fg_title[MAX_PATH] = {0};
+            if (fg) GetWindowTextW(fg, fg_title, MAX_PATH - 1);
+
+            for (long i = 0; i < count; i++) {
+                VARIANT idx;
+                VariantInit(&idx);
+                idx.vt = VT_I4;
+                idx.lVal = i;
+                IDispatch *pWin = disp_get_obj(pWins, L"Item", &idx);
+                if (!pWin) continue;
+                long w_hwnd = disp_get_long(pWin, L"HWND", 0);
+                if (fg && (HWND)(ULONG_PTR)w_hwnd == fg) {
+                    /* On Windows 11 with Explorer tabs, multiple tabs share the same top HWND.
+                     * Prefer the tab whose LocationName appears in the foreground window title. */
+                    wchar_t loc_name[MAX_PATH] = {0};
+                    disp_get_bstr(pWin, L"LocationName", loc_name, MAX_PATH);
+                    if (loc_name[0] && fg_title[0] && wcsstr(fg_title, loc_name) != NULL) {
+                        if (titleMatchedWin) IDispatch_Release(titleMatchedWin);
+                        titleMatchedWin = pWin;
+                        continue;
+                    }
+                    if (!matchedWin) {
+                        matchedWin = pWin;
+                        continue;
+                    }
+                }
+                if (!fallbackWin && w_hwnd != 0) {
+                    fallbackWin = pWin;
+                } else {
+                    IDispatch_Release(pWin);
+                }
+            }
+            if (titleMatchedWin) {
+                if (matchedWin) IDispatch_Release(matchedWin);
+                matchedWin = titleMatchedWin;
+            }
+            IDispatch *useWin = matchedWin ? matchedWin : (target_hwnd == NULL ? fallbackWin : NULL);
+            if (useWin) {
+                IDispatch *pDoc = disp_get_obj(useWin, L"Document", NULL);
+                if (pDoc) {
+                    IDispatch *pFolder = disp_get_obj(pDoc, L"Folder", NULL);
+                    if (pFolder) {
+                        IDispatch *pSelf = disp_get_obj(pFolder, L"Self", NULL);
+                        if (pSelf) {
+                            wchar_t fpath[MAX_PATH * 2];
+                            if (disp_get_bstr(pSelf, L"Path", fpath, MAX_PATH * 2) &&
+                                GetFileAttributesW(fpath) != INVALID_FILE_ATTRIBUTES) {
+                                append_line(out_buf, max_chars, L"FOLDER\t", fpath);
+                            }
+                            IDispatch_Release(pSelf);
+                        }
+                        IDispatch_Release(pFolder);
+                    }
+                    IDispatch *pSel = disp_get_obj(pDoc, L"SelectedItems", NULL);
+                    if (pSel) {
+                        long sel_count = disp_get_long(pSel, L"Count", 0);
+                        if (sel_count > 256) sel_count = 256;
+                        for (long j = 0; j < sel_count; j++) {
+                            VARIANT jdx;
+                            VariantInit(&jdx);
+                            jdx.vt = VT_I4;
+                            jdx.lVal = j;
+                            IDispatch *pItem = disp_get_obj(pSel, L"Item", &jdx);
+                            if (pItem) {
+                                wchar_t ipath[MAX_PATH * 2];
+                                if (disp_get_bstr(pItem, L"Path", ipath, MAX_PATH * 2) &&
+                                    GetFileAttributesW(ipath) != INVALID_FILE_ATTRIBUTES) {
+                                    append_line(out_buf, max_chars, L"FILE\t", ipath);
+                                }
+                                IDispatch_Release(pItem);
+                            }
+                        }
+                        IDispatch_Release(pSel);
+                    }
+                    IDispatch_Release(pDoc);
+                }
+            }
+            if (matchedWin && fallbackWin && matchedWin != fallbackWin) IDispatch_Release(fallbackWin);
+            if (matchedWin) IDispatch_Release(matchedWin);
+            else if (fallbackWin) IDispatch_Release(fallbackWin);
+            IDispatch_Release(pWins);
+        }
+        IDispatch_Release(pShell);
+    }
+    if (SUCCEEDED(hr_init)) CoUninitialize();
+    return out_buf[0] != 0 ? 1 : 0;
+}
+
+/* ---------- entry points (hosted by rundll32.exe or in-process thread) ---------- */
 
 static HINSTANCE g_module;
 
@@ -579,37 +790,34 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID reserved)
 __declspec(dllexport) void CALLBACK RunDaemonW(HWND w, HINSTANCE i, LPWSTR cmd, int show)
 {
     (void)w; (void)i; (void)show;
-    printf("DEBUG: RunDaemonW started with cmd='%ls'\n", cmd ? cmd : L""); fflush(stdout);
     wchar_t *argv[8];
     wchar_t *copy = _wcsdup(cmd ? cmd : L"");
-    if (!copy) { printf("DEBUG: _wcsdup failed\n"); fflush(stdout); return; }
+    if (!copy) return;
     int argc = tokenize(copy, argv, 8);
-    printf("DEBUG: argc=%d\n", argc); fflush(stdout);
 
     DWORD parent_pid = 0;
     for (int k = 0; k + 1 < argc; k++)
         if (wcscmp(argv[k], L"--parent") == 0) parent_pid = (DWORD)_wtol(argv[k + 1]);
     free(copy);
-    printf("DEBUG: parent_pid=%lu\n", parent_pid); fflush(stdout);
-    if (!parent_pid) return;
+    if (!parent_pid) parent_pid = GetCurrentProcessId();
 
     HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, parent_pid);
-    printf("DEBUG: OpenProcess parent=%p\n", parent); fflush(stdout);
     if (!parent) return;
     g_parent_pid = parent_pid;
 
-    /* Terminate any stale daemon instance left over from an earlier session */
-    HWND old_wnd = FindWindowExW(HWND_MESSAGE, NULL, WND_CLASS, NULL);
-    if (old_wnd) {
+    /* Terminate any stale external daemon instances left over from earlier sessions */
+    HWND old_wnd = NULL;
+    while ((old_wnd = FindWindowExW(HWND_MESSAGE, old_wnd, WND_CLASS, NULL)) != NULL) {
         DWORD old_pid = 0;
         GetWindowThreadProcessId(old_wnd, &old_pid);
         if (old_pid && old_pid != GetCurrentProcessId()) {
-            HANDLE old_proc = OpenProcess(PROCESS_TERMINATE, FALSE, old_pid);
+            HANDLE old_proc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, old_pid);
             if (old_proc) {
                 TerminateProcess(old_proc, 0);
+                WaitForSingleObject(old_proc, 1000);
                 CloseHandle(old_proc);
-                Sleep(50);
             }
+            old_wnd = NULL;
         }
     }
 
@@ -617,9 +825,7 @@ __declspec(dllexport) void CALLBACK RunDaemonW(HWND w, HINSTANCE i, LPWSTR cmd, 
     BOOL have_msa = user_only_descriptor(&msa);
     HANDLE single = CreateMutexW(have_msa ? &msa : NULL, TRUE, L"Local\\RATT.Daemon.v2");
     if (have_msa) LocalFree(msa.lpSecurityDescriptor);
-    printf("DEBUG: CreateMutex single=%p err=%lu\n", single, GetLastError()); fflush(stdout);
-    if (!single || GetLastError() == ERROR_ALREADY_EXISTS) {
-        printf("DEBUG: Mutex failed or already exists!\n"); fflush(stdout);
+    if (!g_event_cb && (!single || GetLastError() == ERROR_ALREADY_EXISTS)) {
         if (single) CloseHandle(single);
         CloseHandle(parent);
         return;
@@ -635,15 +841,15 @@ __declspec(dllexport) void CALLBACK RunDaemonW(HWND w, HINSTANCE i, LPWSTR cmd, 
     wc.lpszClassName = WND_CLASS;
     RegisterClassW(&wc);
     g_wnd = CreateWindowExW(0, WND_CLASS, L"RATT helper", 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, g_module, NULL);
-    printf("DEBUG: CreateWindow g_wnd=%p err=%lu\n", g_wnd, GetLastError()); fflush(stdout);
     if (!g_wnd) { CloseHandle(parent); CloseHandle(single); return; }
 
-    HANDLE t = CreateThread(NULL, 0, pipe_thread, (LPVOID)(ULONG_PTR)parent_pid, 0, NULL);
-    if (t) CloseHandle(t);
+    if (!g_event_cb) {
+        HANDLE t = CreateThread(NULL, 0, pipe_thread, (LPVOID)(ULONG_PTR)parent_pid, 0, NULL);
+        if (t) CloseHandle(t);
+    }
 
     for (;;) {
         DWORD r = MsgWaitForMultipleObjects(1, &parent, FALSE, INFINITE, QS_ALLINPUT);
-        printf("DEBUG: MsgWaitForMultipleObjects returned %lu\n", r); fflush(stdout);
         if (r == WAIT_OBJECT_0) break;               /* the app has ended */
         MSG m;
         int quit = 0;
@@ -654,7 +860,6 @@ __declspec(dllexport) void CALLBACK RunDaemonW(HWND w, HINSTANCE i, LPWSTR cmd, 
         }
         if (quit) break;
     }
-    printf("DEBUG: Loop exited!\n"); fflush(stdout);
 
     chord_end();
     for (int id = 1; id <= ID_MAX_STATIC; id++) UnregisterHotKey(g_wnd, id);

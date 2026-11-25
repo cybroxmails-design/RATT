@@ -57,13 +57,14 @@ class MainActivity : Activity() {
             val pcIp = prefs.getString("paired_pc_ip", null) ?: return
             thread(isDaemon = true) {
                 try {
-                    val url = URL("http://$pcIp:49211/sync_from_phone")
+                    val url = URL("http://$pcIp:49210/sync_from_phone")
                     val conn = url.openConnection() as HttpURLConnection
                     conn.requestMethod = "POST"
                     conn.doOutput = true
                     conn.connectTimeout = 2000
                     conn.readTimeout = 2000
                     conn.setRequestProperty("Content-Type", "application/json")
+                    conn.setRequestProperty("X-RATT-Token", SlotRepository.getOrCreateSyncToken(context))
                     val json = JSONObject().apply {
                         if (content.isEmpty()) {
                             put("action", "CLEAR_SLOT")
@@ -103,55 +104,55 @@ class MainActivity : Activity() {
         fun sendClearSlotToPc(context: Context, slotId: Int) {
             val prefs = context.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
             val pcIp = prefs.getString("paired_pc_ip", null) ?: return
+            val token = SlotRepository.getOrCreateSyncToken(context)
             thread(isDaemon = true) {
-                for (port in listOf(49211, 49210)) {
-                    try {
-                        val url = URL("http://$pcIp:$port/sync_from_phone")
-                        val conn = url.openConnection() as HttpURLConnection
-                        conn.requestMethod = "POST"
-                        conn.doOutput = true
-                        conn.connectTimeout = 2000
-                        conn.readTimeout = 2000
-                        conn.setRequestProperty("Content-Type", "application/json")
-                        val json = JSONObject().apply {
-                            put("action", "CLEAR_SLOT")
-                            put("slot_id", slotId)
-                            put("content", "")
-                        }
-                        val out = conn.outputStream
-                        out.write(json.toString().toByteArray(Charsets.UTF_8))
-                        out.flush()
-                        out.close()
-                        conn.responseCode
-                    } catch (_: Exception) {}
-                }
+                try {
+                    val url = URL("http://$pcIp:49210/sync_from_phone")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.doOutput = true
+                    conn.connectTimeout = 2000
+                    conn.readTimeout = 2000
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.setRequestProperty("X-RATT-Token", token)
+                    val json = JSONObject().apply {
+                        put("action", "CLEAR_SLOT")
+                        put("slot_id", slotId)
+                        put("content", "")
+                    }
+                    val out = conn.outputStream
+                    out.write(json.toString().toByteArray(Charsets.UTF_8))
+                    out.flush()
+                    out.close()
+                    conn.responseCode
+                } catch (_: Exception) {}
             }
         }
 
         fun sendClearAllToPc(context: Context) {
             val prefs = context.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
             val pcIp = prefs.getString("paired_pc_ip", null) ?: return
+            val token = SlotRepository.getOrCreateSyncToken(context)
             thread(isDaemon = true) {
-                for (port in listOf(49211, 49210)) {
-                    try {
-                        val url = URL("http://$pcIp:$port/sync_from_phone")
-                        val conn = url.openConnection() as HttpURLConnection
-                        conn.requestMethod = "POST"
-                        conn.doOutput = true
-                        conn.connectTimeout = 2000
-                        conn.readTimeout = 2000
-                        conn.setRequestProperty("Content-Type", "application/json")
-                        val json = JSONObject().apply {
-                            put("action", "CLEAR_ALL")
-                            put("content", "")
-                        }
-                        val out = conn.outputStream
-                        out.write(json.toString().toByteArray(Charsets.UTF_8))
-                        out.flush()
-                        out.close()
-                        conn.responseCode
-                    } catch (_: Exception) {}
-                }
+                try {
+                    val url = URL("http://$pcIp:49210/sync_from_phone")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.doOutput = true
+                    conn.connectTimeout = 2000
+                    conn.readTimeout = 2000
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.setRequestProperty("X-RATT-Token", token)
+                    val json = JSONObject().apply {
+                        put("action", "CLEAR_ALL")
+                        put("content", "")
+                    }
+                    val out = conn.outputStream
+                    out.write(json.toString().toByteArray(Charsets.UTF_8))
+                    out.flush()
+                    out.close()
+                    conn.responseCode
+                } catch (_: Exception) {}
             }
         }
     }
@@ -821,9 +822,10 @@ class MainActivity : Activity() {
     private fun showPairingDialog() {
         val prefs = getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
         val curIp = prefs.getString("paired_pc_ip", "") ?: ""
+        val phonePin = SlotRepository.generatePairingPin()
 
-        val input = EditText(this).apply {
-            hint = "e.g. 192.168.100.4"
+        val inputIp = EditText(this).apply {
+            hint = "PC IP Address (e.g. 192.168.x.x)"
             textSize = 15f
             setTextColor(Color.parseColor("#39FF14"))
             typeface = Typeface.MONOSPACE
@@ -831,35 +833,87 @@ class MainActivity : Activity() {
             setPadding(dp(12), dp(12), dp(12), dp(12))
             if (curIp.isNotEmpty() && curIp != "Not Paired Yet") {
                 setText(curIp)
-            } else {
-                setText("192.168.100.4")
             }
             setSelection(text.length)
         }
 
-        val container = FrameLayout(this).apply {
+        val inputPin = EditText(this).apply {
+            hint = "6-Digit Pairing PIN from PC"
+            textSize = 15f
+            setTextColor(Color.parseColor("#00BFFF"))
+            typeface = Typeface.MONOSPACE
+            background = createRounded(Color.parseColor("#0D1117"), Color.parseColor("#30363D"), 1, 6f)
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        }
+
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
             setPadding(dp(20), dp(12), dp(20), dp(4))
-            addView(input)
+            addView(inputIp)
+            val spacer = View(this@MainActivity).apply {
+                layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(10))
+            }
+            addView(spacer)
+            addView(inputPin)
         }
 
         AlertDialog.Builder(this)
-            .setTitle("🔗 Pair with Windows PC (Free Sync)")
-            .setMessage("Enter the IPv4 address of your Windows PC running RATT (shown at the top of your PC RATT window).\n\nAndroid to Windows PC sync is 100% Free!")
+            .setTitle("🔗 Secure Pair with Windows PC")
+            .setMessage("On PC, click 'Pair Android' to get your PC IP and 6-digit PIN.\n(Phone Pairing PIN: $phonePin)")
             .setView(container)
-            .setPositiveButton("Save & Pair") { _, _ ->
-                val entered = input.text.toString().trim()
-                if (entered.isNotEmpty()) {
-                    prefs.edit().putString("paired_pc_ip", entered).apply()
-                    pcIpLabel?.text = "Connected PC IP: $entered"
-                    val count = pushAllSlotsToPc(this)
-                    Toast.makeText(this, "Paired with PC: $entered! (Pushed $count slots to PC)", Toast.LENGTH_SHORT).show()
+            .setPositiveButton("Pair & Sync") { _, _ ->
+                val enteredIp = inputIp.text.toString().trim()
+                val enteredPin = inputPin.text.toString().trim()
+                if (enteredIp.isEmpty()) return@setPositiveButton
+                thread(isDaemon = true) {
+                    var pairedOk = false
+                    var errMsg = "Could not reach PC on port 49210"
+                    try {
+                        val url = URL("http://$enteredIp:49210/pair")
+                        val conn = url.openConnection() as HttpURLConnection
+                        conn.requestMethod = "POST"
+                        conn.doOutput = true
+                        conn.connectTimeout = 3000
+                        conn.readTimeout = 3000
+                        conn.setRequestProperty("Content-Type", "application/json")
+                        val body = JSONObject().apply {
+                            put("action", "PAIR")
+                            put("pin", enteredPin)
+                        }
+                        conn.outputStream.use {
+                            it.write(body.toString().toByteArray(Charsets.UTF_8))
+                            it.flush()
+                        }
+                        val code = conn.responseCode
+                        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+                        val respText = stream?.bufferedReader()?.readText().orEmpty()
+                        if (code == 200) {
+                            val respJson = JSONObject(respText)
+                            val token = respJson.optString("sync_token", "")
+                            if (token.length >= 16) {
+                                SlotRepository.setSyncToken(this@MainActivity, token)
+                                prefs.edit().putString("paired_pc_ip", enteredIp).apply()
+                                pairedOk = true
+                            } else {
+                                errMsg = "PC did not return a valid sync token"
+                            }
+                        } else {
+                            errMsg = try { JSONObject(respText).optString("error", "Pairing rejected ($code)") } catch (_: Exception) { "Pairing rejected ($code)" }
+                        }
+                    } catch (e: Exception) {
+                        errMsg = e.message ?: errMsg
+                    }
+                    runOnUiThread {
+                        if (pairedOk) {
+                            pcIpLabel?.text = "Connected PC IP: $enteredIp"
+                            val count = pushAllSlotsToPc(this@MainActivity)
+                            Toast.makeText(this@MainActivity, "Paired securely with PC ($enteredIp)! Synced $count slots.", Toast.LENGTH_LONG).show()
+                        } else {
+                            Toast.makeText(this@MainActivity, "Pairing failed: $errMsg", Toast.LENGTH_LONG).show()
+                        }
+                    }
                 }
-            }
-            .setNeutralButton("Use PC (192.168.100.4)") { _, _ ->
-                prefs.edit().putString("paired_pc_ip", "192.168.100.4").apply()
-                pcIpLabel?.text = "Connected PC IP: 192.168.100.4"
-                val count = pushAllSlotsToPc(this)
-                Toast.makeText(this, "Paired with PC: 192.168.100.4! (Pushed $count slots to PC)", Toast.LENGTH_SHORT).show()
             }
             .setNegativeButton("Cancel", null)
             .show()
@@ -1147,7 +1201,7 @@ class MainActivity : Activity() {
         val lastTargetIp = prefs.getString("last_${targetPlatform.lowercase()}_ip", "") ?: ""
 
         val input = EditText(this).apply {
-            hint = "e.g. 192.168.100.15"
+            hint = "e.g. <target-device-ip>"
             textSize = 15f
             setTextColor(Color.parseColor("#39FF14"))
             typeface = Typeface.MONOSPACE

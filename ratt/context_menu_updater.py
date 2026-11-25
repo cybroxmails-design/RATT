@@ -24,7 +24,8 @@ import winreg
 
 from ratt import native
 
-CLSID = "{B2D6C4A1-3E7F-4C59-9A18-5D0E7F6A4B21}"
+CLSID = "{B2D6C4A2-3E7F-4C59-9A18-5D0E7F6A4B21}"
+LEGACY_CLSIDS = ("{B2D6C4A1-3E7F-4C59-9A18-5D0E7F6A4B21}",)
 HANDLER_KEYS = [
     r"Software\Classes\*\shellex\ContextMenuHandlers\RATT",
     r"Software\Classes\Directory\shellex\ContextMenuHandlers\RATT",
@@ -224,8 +225,9 @@ def _register(dll):
     """Point Explorer's context-menu handlers (files, folders, folder background) at the DLL."""
     if not _should_register_hkcu():
         return
-    _set(rf"Software\Classes\CLSID\{CLSID}", default="RATT right-click menu")
-    _set(rf"Software\Classes\CLSID\{CLSID}\InProcServer32", default=dll, ThreadingModel="Apartment")
+    for cid in (CLSID,) + LEGACY_CLSIDS:
+        _set(rf"Software\Classes\CLSID\{cid}", default="RATT right-click menu")
+        _set(rf"Software\Classes\CLSID\{cid}\InProcServer32", default=dll, ThreadingModel="Apartment")
     for key in HANDLER_KEYS:
         _set(key, default=CLSID)
 
@@ -238,6 +240,9 @@ def _remove_old_menus():
 def _register_fallback_menus(state):
     """Fallback Windows Registry cascading menu if Smart App Control blocks the COM DLL."""
     program, prefix = native.launch_command()
+    if not os.path.exists(program):
+        program = "wscript.exe"
+        prefix = f'"{os.path.join(native.app_dir(), "RATT.vbs")}"'
     icon = os.path.join(native.assets_dir(), "ratt_icon.ico")
     cmd_base = f'"{program}" {prefix}'.strip()
     for place in ("*", "Directory", r"Directory\Background"):
@@ -251,6 +256,10 @@ def _register_fallback_menus(state):
             _set(rf"{root}\shell\1{idx:02d}_copy", MUIVerb=f"Copy to Slot {idx}")
             cmd = f'{cmd_base} copy {idx} "%1"' if place != r"Directory\Background" else f"{cmd_base} copy {idx}"
             _set(rf"{root}\shell\1{idx:02d}_copy\command", default=cmd)
+        for idx in range(1, min(state["num_slots"], 10) + 1):
+            _set(rf"{root}\shell\15{idx:02d}_cut", MUIVerb=f"Cut to Slot {idx}")
+            cmd = f'{cmd_base} cut {idx} "%1"' if place != r"Directory\Background" else f"{cmd_base} cut {idx}"
+            _set(rf"{root}\shell\15{idx:02d}_cut\command", default=cmd)
         for idx in list(state["filled"])[:5]:
             _set(rf"{root}\shell\2{idx:02d}_paste", MUIVerb=f"Paste from Slot {idx}")
             cmd = f'{cmd_base} paste {idx} "%1"' if place != r"Directory\Background" else f"{cmd_base} paste {idx}"
@@ -261,7 +270,8 @@ def unregister():
     """Remove RATT from the right-click menu completely."""
     for key in HANDLER_KEYS:
         _delete_tree(key)
-    _delete_tree(rf"Software\Classes\CLSID\{CLSID}")
+    for cid in (CLSID,) + LEGACY_CLSIDS:
+        _delete_tree(rf"Software\Classes\CLSID\{cid}")
     _remove_old_menus()
 
 

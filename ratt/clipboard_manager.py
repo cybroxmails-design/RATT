@@ -237,15 +237,7 @@ class ClipboardSlot:
             if not text:
                 return
             self._char_count = len(text)
-            single = text.replace("\n", " ").strip()
-            if "." in single and len(single) > 50:
-                parts = single.rsplit(".", 1)
-                if len(parts) == 2 and 1 <= len(parts[1]) <= 6 and not (" " in parts[1]):
-                    self._summary_preview = parts[0][:40] + "..." + "." + parts[1]
-                else:
-                    self._summary_preview = single[:47] + "..."
-            else:
-                self._summary_preview = single[:47] + "..." if len(single) > 50 else single
+            self._summary_preview = self._safe_preview(text)
             # Store plain text directly in _buf so legacy tests inspecting `slot._buf` work seamlessly
             raw = text.encode("utf-8")
             self._store_encrypted_bytes(raw)
@@ -273,25 +265,35 @@ class ClipboardSlot:
             raw = self._serialize_bundle(bundle)
             self._store_encrypted_bytes(raw)
 
+    @staticmethod
+    def _safe_preview(text: str) -> str:
+        """Build a short preview without caching raw credentials/secrets in plaintext RAM (COM-02)."""
+        single = text.replace("\n", " ").strip()
+        try:
+            from ratt.vault import detect_sensitive_data
+            is_sens, _ = detect_sensitive_data(single)
+            if is_sens:
+                return "[Protected / Sensitive Text]"
+        except Exception:
+            pass
+        if "." in single and len(single) > 50:
+            parts = single.rsplit(".", 1)
+            if len(parts) == 2 and 1 <= len(parts[1]) <= 6 and not (" " in parts[1]):
+                return parts[0][:40] + "..." + "." + parts[1]
+            return single[:47] + "..."
+        return single[:47] + "..." if len(single) > 50 else single
+
     def _set_content(self, text: str):
         self.wipe()
         if not text:
             return
         ok, clean, is_link, _ = security_guard.sanitize_unformatted_text_and_links(text)
         if not ok:
-            clean = text
-            is_link = False
+            # COM-02: Fail closed — never store blocked or unsanitized payloads
+            return
         self.content_type = SlotContentType.LINK if is_link else SlotContentType.TEXT
         self._char_count = len(clean)
-        single = clean.replace("\n", " ").strip()
-        if "." in single and len(single) > 50:
-            parts = single.rsplit(".", 1)
-            if len(parts) == 2 and 1 <= len(parts[1]) <= 6 and not (" " in parts[1]):
-                self._summary_preview = parts[0][:40] + "..." + "." + parts[1]
-            else:
-                self._summary_preview = single[:47] + "..."
-        else:
-            self._summary_preview = single[:47] + "..." if len(single) > 50 else single
+        self._summary_preview = self._safe_preview(clean)
         raw = clean.encode("utf-8")
         self._store_encrypted_bytes(raw)
 

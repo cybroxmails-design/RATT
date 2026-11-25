@@ -121,10 +121,14 @@ def validate_file_list(paths: List[str]) -> Tuple[bool, List[str], str]:
         if cleaned.startswith("\\\\") or cleaned.startswith("//"):
             return False, [], "Security Block: Remote network (UNC/SMB) and device paths are prohibited."
 
-        # 3. Block NTFS Alternate Data Streams (e.g. C:\dir\doc.pdf:evil.exe)
-        drive, tail = os.path.splitdrive(cleaned)
-        if not drive or ":" in tail:
-            return False, [], "Security Block: NTFS Alternate Data Streams (ADS) are prohibited."
+        # 3. Block NTFS Alternate Data Streams on Windows; require absolute path on POSIX (MAC-03)
+        if os.name == "nt":
+            drive, tail = os.path.splitdrive(cleaned)
+            if not drive or ":" in tail:
+                return False, [], "Security Block: NTFS Alternate Data Streams (ADS) are prohibited."
+        else:
+            if not os.path.isabs(cleaned):
+                return False, [], "Security Block: Only absolute local file paths are permitted."
 
         norm_path = os.path.abspath(os.path.normpath(cleaned))
         basename = os.path.basename(norm_path).rstrip(". ")
@@ -136,17 +140,14 @@ def validate_file_list(paths: List[str]) -> Tuple[bool, List[str], str]:
         if stem in _RESERVED_DEVICES:
             return False, [], f"Security Block: Reserved device name '{basename}' is prohibited."
 
-        # 5. Inspect final extension AND all intermediate extensions (double-extension guard: e.g. report.pdf.exe)
-        parts = basename.lower().split(".")
-        if len(parts) > 1:
-            for ext_part in parts[1:]:
-                dot_ext = "." + ext_part
-                if dot_ext in BLOCKED_EXTENSIONS:
-                    return (
-                        False,
-                        [],
-                        f"Security Block: '{basename}' has a restricted executable/script extension ({dot_ext}).",
-                    )
+        # 5. Inspect the active final extension (and block double-extension executables where final extension is executable)
+        _, final_ext = os.path.splitext(basename.lower())
+        if final_ext in BLOCKED_EXTENSIONS:
+            return (
+                False,
+                [],
+                f"Security Block: '{basename}' has a restricted executable/script extension ({final_ext}).",
+            )
 
         # 6. Verify path exists on local disk and check resolved symlink/reparse target
         if not os.path.exists(norm_path):
@@ -242,8 +243,13 @@ def sanitize_unformatted_text_and_links(
         raw_m = match.group(1)
         scheme = raw_m.split(":", 1)[0].lower() + ":"
         rest = raw_m.split(":", 1)[1]
-        # Only block if scheme matches AND is followed by slashes or no space (e.g. javascript:... or file://...)
-        if scheme in BLOCKED_URI_SCHEMES and (rest.startswith("//") or rest.startswith("\\\\") or scheme in ("javascript:", "vbscript:", "data:", "hta:")):
+        # Only block if scheme matches AND is followed by slashes or executable protocol syntax (e.g. javascript:..., ms-msdt:/id..., file://...)
+        if scheme in BLOCKED_URI_SCHEMES and (
+            rest.startswith("//")
+            or rest.startswith("\\\\")
+            or scheme in ("javascript:", "vbscript:", "data:", "hta:")
+            or scheme.startswith("ms-")
+        ):
             return (
                 False,
                 "",

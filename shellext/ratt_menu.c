@@ -31,8 +31,10 @@
 #include <string.h>
 #include <wchar.h>
 
-/* {B2D6C4A1-3E7F-4C59-9A18-5D0E7F6A4B21} */
+/* {B2D6C4A2-3E7F-4C59-9A18-5D0E7F6A4B21} and legacy {B2D6C4A1-3E7F-4C59-9A18-5D0E7F6A4B21} */
 static const CLSID CLSID_RattMenu =
+    {0xB2D6C4A2, 0x3E7F, 0x4C59, {0x9A, 0x18, 0x5D, 0x0E, 0x7F, 0x6A, 0x4B, 0x21}};
+static const CLSID CLSID_RattMenuLegacy =
     {0xB2D6C4A1, 0x3E7F, 0x4C59, {0x9A, 0x18, 0x5D, 0x0E, 0x7F, 0x6A, 0x4B, 0x21}};
 
 #define MAX_BMPS 600
@@ -413,15 +415,44 @@ static BOOL valid_launcher_path(const wchar_t *launcher, const wchar_t *prefix)
  * running yet, start it with the action as its argument instead. */
 static BOOL send_to_helper(const wchar_t *args)
 {
-    HWND helper = FindWindowExW(HWND_MESSAGE, NULL, L"RATTDaemonWnd", NULL);
-    if (!helper) return FALSE;
     char text[160] = "ACTION ";
     WideCharToMultiByte(CP_UTF8, 0, args, -1, text + 7, (int)sizeof(text) - 8, NULL, NULL);
     COPYDATASTRUCT cd = { 0x52415454u, (DWORD)strlen(text), text };
-    DWORD_PTR result;
     HWND sender = GetShellWindow();
     if (!sender) sender = GetDesktopWindow();
-    return SendMessageTimeoutW(helper, WM_COPYDATA, (WPARAM)sender, (LPARAM)&cd, SMTO_ABORTIFHUNG, 1500, &result) != 0;
+
+    HWND helper = NULL;
+    while ((helper = FindWindowExW(HWND_MESSAGE, helper, L"RATTDaemonWnd", NULL)) != NULL) {
+        DWORD_PTR result = 0;
+        if (SendMessageTimeoutW(helper, WM_COPYDATA, (WPARAM)sender, (LPARAM)&cd,
+                                SMTO_ABORTIFHUNG, 1200, &result) != 0 && result != 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL write_pending_action_if_running(const wchar_t *args)
+{
+    HANDLE hMutex = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\RATT.App.v2");
+    if (!hMutex) return FALSE;
+    CloseHandle(hMutex);
+
+    wchar_t path[MAX_PATH * 2];
+    DWORD len = GetEnvironmentVariableW(L"APPDATA", path, MAX_PATH);
+    if (len == 0 || len >= MAX_PATH) return FALSE;
+    wcscat(path, L"\\RATT\\pending_action.txt");
+    FILE *fp = _wfopen(path, L"wb");
+    if (!fp) return FALSE;
+    char u8[128];
+    if (WideCharToMultiByte(CP_UTF8, 0, args, -1, u8, sizeof(u8), NULL, NULL) > 0) {
+        for (char *p = u8; *p; p++) {
+            if (*p == ' ') *p = '\t';
+        }
+        fprintf(fp, "%s", u8);
+    }
+    fclose(fp);
+    return TRUE;
 }
 
 static void write_shell_context(Ext *e)
@@ -471,6 +502,7 @@ static HRESULT STDMETHODCALLTYPE CM_Invoke(IContextMenu *This, CMINVOKECOMMANDIN
 
     write_shell_context(e);
     if (send_to_helper(e->args[idx])) return S_OK;
+    if (write_pending_action_if_running(e->args[idx])) return S_OK;
 
     wchar_t params[MAX_PATH * 2 + 128];
     _snwprintf(params, sizeof(params) / sizeof(params[0]) - 1, L"%ls %ls", e->prefix, e->args[idx]);
@@ -530,6 +562,12 @@ static HRESULT STDMETHODCALLTYPE SI_Initialize(IShellExtInit *This, PCIDLIST_ABS
                         }
                     }
                 }
+                if (e->folder_path[0] == 0 && e->nsel_files > 0 && e->sel_files[0]) {
+                    wcsncpy(e->folder_path, e->sel_files[0], MAX_PATH * 2 - 1);
+                    e->folder_path[MAX_PATH * 2 - 1] = 0;
+                    wchar_t *slash = wcsrchr(e->folder_path, L'\\');
+                    if (slash) *slash = 0;
+                }
                 GlobalUnlock(stg.hGlobal);
             }
             ReleaseStgMedium(&stg);
@@ -580,7 +618,10 @@ static Factory g_factory = { &g_cfVtbl };
 
 __declspec(dllexport) HRESULT STDAPICALLTYPE DllGetClassObject(REFCLSID rclsid, REFIID riid, void **ppv)
 {
-    if (!IsEqualCLSID(rclsid, &CLSID_RattMenu)) { *ppv = NULL; return CLASS_E_CLASSNOTAVAILABLE; }
+    if (!IsEqualCLSID(rclsid, &CLSID_RattMenu) && !IsEqualCLSID(rclsid, &CLSID_RattMenuLegacy)) {
+        *ppv = NULL;
+        return CLASS_E_CLASSNOTAVAILABLE;
+    }
     return CF_QueryInterface((IClassFactory *)&g_factory, riid, ppv);
 }
 

@@ -14,17 +14,20 @@ class ShareReceiverActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // AND-04: Prevent screenshots and Recents thumbnail leakage of shared clipboard content
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_SECURE)
         SlotRepository.init(this)
 
         val action = intent.action
         val type = intent.type
 
         if (Intent.ACTION_SEND == action && type != null) {
-            val text = intent.getStringExtra(Intent.EXTRA_TEXT)
-            if (!text.isNullOrBlank()) {
-                promptSlotSelection(text.trim())
+            val raw = intent.getStringExtra(Intent.EXTRA_TEXT)
+            val sanitized = if (!raw.isNullOrBlank()) SlotRepository.sanitizeIncomingText(raw.trim()) else null
+            if (!sanitized.isNullOrBlank()) {
+                promptSlotSelection(sanitized)
             } else {
-                Toast.makeText(this, "RATT Mobile supports text and links only.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "RATT Mobile supports safe text and links only.", Toast.LENGTH_SHORT).show()
                 finish()
             }
         } else {

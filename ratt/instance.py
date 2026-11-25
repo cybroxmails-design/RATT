@@ -47,7 +47,7 @@ def _is_ratt_process(pid: int) -> bool:
         sz = wintypes.DWORD(1024)
         if _kernel32.QueryFullProcessImageNameW(proc, 0, buf, ctypes.byref(sz)):
             exe = os.path.basename(buf.value).lower()
-            return exe in ("ratt.exe", "python.exe", "pythonw.exe")
+            return exe in ("ratt.exe", "python.exe", "pythonw.exe", "rundll32.exe")
         return False
     finally:
         _kernel32.CloseHandle(proc)
@@ -88,17 +88,20 @@ def acquire():
     return True
 
 
-def request_show():
-    """Ask the running RATT to bring its window to the front."""
+def request_show(bring_to_front: bool = True):
+    """Ask the running RATT to process pending actions and optionally bring its window to the front."""
+    if os.name != "nt":
+        return
     event = _kernel32.OpenEventW(EVENT_MODIFY_STATE, False, SHOW_EVENT_NAME)
     if event:
         _kernel32.SetEvent(event)
         _kernel32.CloseHandle(event)
-    for title in ("RATT v2 \u2014 Rapid Access To Text", "RATT \u2014 Rapid Access To Text"):
-        hwnd = _user32.FindWindowW(None, title)
-        if hwnd:
-            _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            _user32.SetForegroundWindow(hwnd)
+    if bring_to_front:
+        for title in ("RATT v2 \u2014 Rapid Access To Text", "RATT \u2014 Rapid Access To Text"):
+            hwnd = _user32.FindWindowW(None, title)
+            if hwnd:
+                _user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+                _user32.SetForegroundWindow(hwnd)
 
 
 def watch_for_show(callback):

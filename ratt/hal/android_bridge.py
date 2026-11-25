@@ -238,15 +238,16 @@ def get_wifi_network_info() -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
-def get_paired_android_ip() -> str:
-    """Return the paired phone's IP address (from env or %APPDATA%\\RATT\\paired_phone.txt).
+_PAIRED_ANDROID_IP_MEM: str = ""
 
-    If the saved IP is on a different subnet than the current Wi-Fi adapter (e.g. switched
-    to a Mobile Hotspot), automatically falls back to the Hotspot Gateway IP.
-    """
+
+def get_paired_android_ip() -> str:
+    """Return the paired phone's IP address (from env, in-memory pair state, or paired_phone.txt)."""
     ip = os.environ.get("RATT_ANDROID_IP", "").strip()
     if ip:
         return ip
+    if _PAIRED_ANDROID_IP_MEM and _PAIRED_ANDROID_IP_MEM not in ("127.0.0.1", "localhost"):
+        return _PAIRED_ANDROID_IP_MEM
     folder = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RATT")
     paired_file = os.path.join(folder, "paired_phone.txt")
     val = ""
@@ -273,10 +274,12 @@ def get_paired_android_ip() -> str:
 
 
 def set_paired_android_ip(ip: str) -> None:
-    """Save the paired phone's IP address to %APPDATA%\\RATT\\paired_phone.txt."""
+    """Save the paired phone's IP address in memory and to %APPDATA%\\RATT\\paired_phone.txt."""
+    global _PAIRED_ANDROID_IP_MEM
     ip = ip.strip()
     if not ip:
         return
+    _PAIRED_ANDROID_IP_MEM = ip
     folder = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RATT")
     os.makedirs(folder, exist_ok=True)
     try:
@@ -363,6 +366,8 @@ class AndroidBridgePlatform(BasePlatform):
                     "content": packet.get("text") or packet.get("last_clip") or "",
                     "text": packet.get("text") or packet.get("last_clip") or "",
                     "kind": packet.get("kind", "text"),
+                    "timestamp": time.time(),
+                    "nonce": secrets.token_hex(12),
                 }
                 if "data_b64" in packet:
                     http_payload["data_b64"] = packet["data_b64"]
@@ -373,7 +378,11 @@ class AndroidBridgePlatform(BasePlatform):
                 req = urllib.request.Request(
                     http_url,
                     data=json.dumps(http_payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json", "User-Agent": "RATT-PC"},
+                    headers={
+                        "Content-Type": "application/json",
+                        "User-Agent": "RATT-PC",
+                        "X-RATT-Token": get_pc_sync_token(),
+                    },
                     method="POST"
                 )
                 with urllib.request.urlopen(req, timeout=3.0) as resp:
@@ -538,8 +547,22 @@ class AndroidBridgePlatform(BasePlatform):
         if target_ip and target_ip not in ("127.0.0.1", "localhost"):
             def _http_clear():
                 try:
-                    payload = json.dumps({"action": "CLEAR_SLOT", "slot_id": slot_num}).encode("utf-8")
-                    req = urllib.request.Request(f"http://{target_ip}:49210/clear_slot", data=payload, headers={"Content-Type": "application/json", "User-Agent": "RATT-PC"}, method="POST")
+                    payload = json.dumps({
+                        "action": "CLEAR_SLOT",
+                        "slot_id": slot_num,
+                        "timestamp": time.time(),
+                        "nonce": secrets.token_hex(12),
+                    }).encode("utf-8")
+                    req = urllib.request.Request(
+                        f"http://{target_ip}:49210/clear_slot",
+                        data=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "RATT-PC",
+                            "X-RATT-Token": get_pc_sync_token(),
+                        },
+                        method="POST",
+                    )
                     with urllib.request.urlopen(req, timeout=1.0) as _:
                         pass
                 except Exception:
@@ -571,8 +594,21 @@ class AndroidBridgePlatform(BasePlatform):
         if target_ip and target_ip not in ("127.0.0.1", "localhost"):
             def _http_clear_all():
                 try:
-                    payload = json.dumps({"action": "CLEAR_ALL"}).encode("utf-8")
-                    req = urllib.request.Request(f"http://{target_ip}:49210/clear_all", data=payload, headers={"Content-Type": "application/json", "User-Agent": "RATT-PC"}, method="POST")
+                    payload = json.dumps({
+                        "action": "CLEAR_ALL",
+                        "timestamp": time.time(),
+                        "nonce": secrets.token_hex(12),
+                    }).encode("utf-8")
+                    req = urllib.request.Request(
+                        f"http://{target_ip}:49210/clear_all",
+                        data=payload,
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "RATT-PC",
+                            "X-RATT-Token": get_pc_sync_token(),
+                        },
+                        method="POST",
+                    )
                     with urllib.request.urlopen(req, timeout=1.0) as _:
                         pass
                 except Exception:
@@ -639,16 +675,447 @@ class AndroidBridgePlatform(BasePlatform):
         return self._seq
 
 
-# ---- PC Background Sync Receiver (Port 49211: Mobile -> PC) -------------------
+# ---- PC Background Sync Receiver (Port 49210: Android -> PC) ------------------
 
 _pc_receiver_running = False
+MAX_SYNC_BODY_BYTES = 35 * 1024 * 1024   # Hard cap for Base64-encoded 25 MB payload
+MAX_SYNC_FILE_BYTES = 25 * 1024 * 1024   # 25 MB decoded file cap
+_PAIR_PIN_TTL_SECONDS = 300.0            # 5-minute pairing window
+_PAIR_PIN_MAX_FAILURES = 5
+_PC_SYNC_TOKEN: Optional[str] = None
+_ACTIVE_PAIR_PIN: Optional[str] = None
+_ACTIVE_PAIR_PIN_EXPIRES: float = 0.0
+_PAIR_PIN_FAILURES: int = 0
 
-def start_pc_sync_receiver(clipboard_manager, port: int = 49211):
-    """Start background socket/HTTP server on PC to receive clipboard copy events from mobile."""
+
+def _pair_token_file() -> str:
+    base = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RATT")
+    os.makedirs(base, exist_ok=True)
+    return os.path.join(base, "android_pair.bin")
+
+
+def get_pc_sync_token() -> str:
+    """Return or create the DPAPI-persisted 256-bit sync authentication token."""
+    global _PC_SYNC_TOKEN
+    if _PC_SYNC_TOKEN:
+        return _PC_SYNC_TOKEN
+    try:
+        from ratt.config import AppConfig
+        p = _pair_token_file()
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                dec = AppConfig._dpapi_unprotect(f.read())
+            if dec:
+                tok = dec.decode("utf-8", errors="ignore").strip()
+                if len(tok) >= 16:
+                    _PC_SYNC_TOKEN = tok
+                    return _PC_SYNC_TOKEN
+    except Exception:
+        pass
+    _PC_SYNC_TOKEN = secrets.token_urlsafe(32)
+    set_pc_sync_token(_PC_SYNC_TOKEN)
+    return _PC_SYNC_TOKEN
+
+
+def set_pc_sync_token(token: str) -> None:
+    """Persist the shared PC <-> Android sync token encrypted via DPAPI."""
+    global _PC_SYNC_TOKEN
+    if not token or len(token.strip()) < 16:
+        return
+    _PC_SYNC_TOKEN = token.strip()
+    try:
+        from ratt.config import AppConfig
+        enc = AppConfig._dpapi_protect(_PC_SYNC_TOKEN.encode("utf-8"))
+        if enc:
+            with open(_pair_token_file(), "wb") as f:
+                f.write(enc)
+    except Exception:
+        pass
+
+
+def generate_pairing_pin() -> str:
+    """Generate a single-use 6-digit pairing PIN valid for 5 minutes."""
+    global _ACTIVE_PAIR_PIN, _ACTIVE_PAIR_PIN_EXPIRES, _PAIR_PIN_FAILURES
+    _ACTIVE_PAIR_PIN = f"{secrets.randbelow(1_000_000):06d}"
+    _ACTIVE_PAIR_PIN_EXPIRES = time.time() + _PAIR_PIN_TTL_SECONDS
+    _PAIR_PIN_FAILURES = 0
+    return _ACTIVE_PAIR_PIN
+
+
+def verify_and_consume_pairing_pin(candidate: str) -> bool:
+    """Verify a 6-digit pairing PIN in constant time with 5-attempt lockout."""
+    global _ACTIVE_PAIR_PIN, _ACTIVE_PAIR_PIN_EXPIRES, _PAIR_PIN_FAILURES
+    import hmac as _hmac
+    if not _ACTIVE_PAIR_PIN or time.time() > _ACTIVE_PAIR_PIN_EXPIRES:
+        _ACTIVE_PAIR_PIN = None
+        return False
+    if _PAIR_PIN_FAILURES >= _PAIR_PIN_MAX_FAILURES:
+        _ACTIVE_PAIR_PIN = None
+        return False
+    clean = (candidate or "").strip()
+    if _hmac.compare_digest(clean.encode("utf-8"), _ACTIVE_PAIR_PIN.encode("utf-8")):
+        _ACTIVE_PAIR_PIN = None
+        _PAIR_PIN_FAILURES = 0
+        return True
+    _PAIR_PIN_FAILURES += 1
+    return False
+
+
+def pair_with_android_device(phone_ip: str, pin: str = "") -> Tuple[bool, str]:
+    """Perform authenticated pairing handshake with an Android device on port 49210."""
+    import urllib.error
+    import urllib.request
+    target = (phone_ip or "").strip()
+    if not target:
+        return False, "Please enter a valid Android IP address."
+    set_paired_android_ip(target)
+    token = get_pc_sync_token()
+    pc_ip, _ = get_wifi_network_info()
+    try:
+        payload = json.dumps({
+            "action": "PAIR",
+            "pin": (pin or "").strip(),
+            "pc_ip": pc_ip or "",
+            "sync_token": token,
+            "timestamp": time.time(),
+            "nonce": secrets.token_hex(12),
+        }).encode("utf-8")
+        req = urllib.request.Request(
+            f"http://{target}:{ANDROID_BRIDGE_PORT}/pair",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "RATT-PC",
+                "X-RATT-Token": token,
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=4.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("status") == "ok":
+                if data.get("sync_token"):
+                    set_pc_sync_token(str(data["sync_token"]))
+                return True, f"Paired securely with Android ({target})!"
+            return False, data.get("error", "Pairing rejected by Android.")
+    except urllib.error.HTTPError as he:
+        try:
+            err_body = he.read().decode("utf-8", errors="ignore")
+            err_msg = json.loads(err_body).get("error", str(he))
+        except Exception:
+            err_msg = str(he)
+        return False, f"Pairing rejected by Phone ({target}): {err_msg}"
+    except Exception as e:
+        return False, f"Could not reach Phone ({target}:49210): {e}"
+
+
+def _is_safe_inbound_filename(fname: str) -> bool:
+    """Validate an inbound filename BEFORE writing any byte to disk (WIN-01)."""
+    if not fname or not isinstance(fname, str):
+        return False
+    if security_guard.contains_bidi_spoofing(fname) or "\x00" in fname:
+        return False
+    base = os.path.basename(fname.strip()).rstrip(". ")
+    if not base or base in (".", "..") or "/" in base or "\\" in base or ":" in base:
+        return False
+    stem = base.split(".")[0].upper()
+    if stem in security_guard._RESERVED_DEVICES:
+        return False
+    parts = base.lower().split(".")
+    if len(parts) > 1:
+        for ext_part in parts[1:]:
+            if ("." + ext_part) in security_guard.BLOCKED_EXTENSIONS:
+                return False
+    return True
+
+
+def _verify_sync_request_auth(headers: dict, payload: dict, peer_ip: str) -> bool:
+    """Enforce mutual auth token & peer IP allowlist on inbound PC sync (WIN-01)."""
+    import hmac as _hmac
+    supplied = (
+        headers.get("x-ratt-token")
+        or (payload.get("auth_token") if isinstance(payload, dict) else None)
+        or ""
+    )
+    if not supplied or not isinstance(supplied, str):
+        return False
+    expected = get_pc_sync_token()
+    if not _hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+        return False
+    paired_ip = get_paired_android_ip()
+    allowed_ips = {"127.0.0.1", "::1"}
+    if paired_ip:
+        allowed_ips.add(paired_ip)
+    return peer_ip in allowed_ips
+
+
+def _send_sync_http(client, status: str, obj: dict):
+    resp_bytes = json.dumps(obj).encode("utf-8")
+    resp = (
+        f"HTTP/1.1 {status}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(resp_bytes)}\r\n"
+        f"Connection: close\r\n\r\n"
+    ).encode("ascii") + resp_bytes
+    client.sendall(resp)
+
+
+def _handle_pc_sync_client(client, addr, clipboard_manager):
+    """Handle one inbound Android->PC sync connection with strict auth, size & file validation."""
+    try:
+        peer_ip = addr[0] if addr else ""
+        # WIN-01: Never auto-overwrite paired_android_ip from untrusted connections
+        client.settimeout(3.0)
+        raw = b""
+        headers_map = {}
+        request_path = ""
+        body = ""
+        while len(raw) < 65536:
+            try:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                raw += chunk
+                if b"\r\n\r\n" in raw:
+                    headers_part, body_part = raw.split(b"\r\n\r\n", 1)
+                    request_line = headers_part.split(b"\r\n")[0].decode("latin-1", errors="ignore")
+                    request_path = request_line.split(" ")[1] if len(request_line.split(" ")) > 1 else ""
+                    content_len = 0
+                    for line in headers_part.split(b"\r\n")[1:]:
+                        if b":" in line:
+                            k, v = line.split(b":", 1)
+                            headers_map[k.decode("latin-1").strip().lower()] = v.decode("latin-1").strip()
+                    if "content-length" in headers_map:
+                        try:
+                            content_len = int(headers_map["content-length"])
+                        except Exception:
+                            _send_sync_http(client, "400 Bad Request", {"status": "error", "error": "Invalid Content-Length"})
+                            return
+                    if content_len < 0 or content_len > MAX_SYNC_BODY_BYTES:
+                        _send_sync_http(client, "413 Payload Too Large", {"status": "error", "error": "Payload exceeds maximum allowed size"})
+                        return
+                    while len(body_part) < content_len:
+                        remaining = content_len - len(body_part)
+                        more = client.recv(min(16384, remaining))
+                        if not more:
+                            break
+                        body_part += more
+                        if len(body_part) > MAX_SYNC_BODY_BYTES:
+                            _send_sync_http(client, "413 Payload Too Large", {"status": "error", "error": "Payload exceeds maximum allowed size"})
+                            return
+                    body = body_part[:content_len].decode("utf-8", errors="ignore") if content_len else body_part.decode("utf-8", errors="ignore")
+                    break
+                elif not raw.startswith(b"POST ") and not raw.startswith(b"GET "):
+                    body = raw.decode("utf-8", errors="ignore")
+                    break
+            except Exception:
+                break
+        else:
+            _send_sync_http(client, "431 Request Header Fields Too Large", {"status": "error", "error": "Headers too large"})
+            return
+
+        if body:
+            try:
+                payload = json.loads(body)
+                if not isinstance(payload, dict):
+                    payload = {}
+            except Exception:
+                payload = {}
+
+            # Authenticated 6-digit PIN pairing handshake (/pair)
+            if request_path.startswith("/pair") or (payload.get("action") or "").upper() == "PAIR":
+                candidate_pin = str(payload.get("pin") or "")
+                if not verify_and_consume_pairing_pin(candidate_pin):
+                    _send_sync_http(client, "401 Unauthorized", {"status": "error", "error": "Invalid or expired pairing PIN"})
+                    return
+                if peer_ip and peer_ip not in ("127.0.0.1", "::1", "localhost"):
+                    set_paired_android_ip(peer_ip)
+                elif payload.get("phone_ip"):
+                    set_paired_android_ip(str(payload["phone_ip"]).strip())
+                pc_ip, _ = get_wifi_network_info()
+                _send_sync_http(client, "200 OK", {
+                    "status": "ok",
+                    "sync_token": get_pc_sync_token(),
+                    "pc_ip": pc_ip or "",
+                })
+                return
+
+            # WIN-01: Enforce authentication token + allowed peer IP
+            if not _verify_sync_request_auth(headers_map, payload, peer_ip):
+                _send_sync_http(client, "401 Unauthorized", {"status": "error", "error": "Authentication required"})
+                return
+
+            action = (payload.get("action") or "").upper()
+            content = payload.get("content", "")
+            raw_slot = payload.get("slot_id") or payload.get("slot") or 1
+            try:
+                slot_id = int(raw_slot)
+            except Exception:
+                slot_id = 1
+
+            cfg = getattr(clipboard_manager, "config", None)
+            max_slots = getattr(cfg, "max_slots", 10) if cfg else 10
+            if slot_id < 1 or slot_id > max_slots:
+                _send_sync_http(client, "400 Bad Request", {"status": "error", "error": "Invalid slot id"})
+                return
+
+            resp_obj = {"status": "ok"}
+            if cfg and hasattr(cfg, "user") and hasattr(cfg.user, "tier"):
+                resp_obj["tier"] = cfg.user.tier.value
+
+            if action in ("CROSS_SYNC_IOS", "CROSS_SYNC_MACOS"):
+                is_prem = bool(cfg and getattr(cfg, "is_premium", False))
+                if not is_prem:
+                    resp_obj = {"status": "error", "error": UPGRADE_CROSS_SYNC_MSG, "upgrade_required": True}
+                else:
+                    resp_obj["status"] = "ok"
+
+            elif action in ("CLEAR_SLOT", "CLEAR", "DELETE"):
+                try:
+                    clipboard_manager.clear_slot(slot_id)
+                    if hasattr(clipboard_manager, "_notify_listeners"):
+                        clipboard_manager._notify_listeners()
+                    if hasattr(clipboard_manager, "app") and clipboard_manager.app:
+                        clipboard_manager.app._clip_dirty = True
+                        if hasattr(clipboard_manager.app, "root"):
+                            clipboard_manager.app.root.after(0, clipboard_manager.app._refresh_slots)
+                except Exception:
+                    pass
+
+            elif not content and action in ("SYNC_FROM_PHONE", "SYNC_FROM_ANDROID", "PUSH_ALL_SLOTS"):
+                cur = clipboard_manager.get_slot(slot_id)
+                if cur and not cur.is_empty:
+                    try:
+                        clipboard_manager.copy_to_android(slot_id)
+                    except Exception:
+                        pass
+
+            elif action in ("CLEAR_ALL", "CLEARALL", "DELETE_ALL"):
+                try:
+                    clipboard_manager.clear_all()
+                    if hasattr(clipboard_manager, "_notify_listeners"):
+                        clipboard_manager._notify_listeners()
+                    if hasattr(clipboard_manager, "app") and clipboard_manager.app:
+                        clipboard_manager.app._clip_dirty = True
+                        if hasattr(clipboard_manager.app, "root"):
+                            clipboard_manager.app.root.after(0, clipboard_manager.app._refresh_slots)
+                except Exception:
+                    pass
+
+            elif content and (action in ("SYNC_FROM_PHONE", "SYNC_FROM_ANDROID", "PUSH_ALL_SLOTS", "CROSS_SYNC") or not action):
+                cur = clipboard_manager.get_slot(slot_id)
+                from ratt.clipboard_manager import SlotContentType
+                if cur and cur.content_type in (SlotContentType.FILES, SlotContentType.IMAGE, SlotContentType.DIAGRAM) and (
+                    content.startswith("[FILE]") or (cur.timestamp and (datetime.now() - cur.timestamp).total_seconds() < 5.0)
+                ):
+                    pass
+                else:
+                    try:
+                        parsed_content = None
+                        if isinstance(content, str) and content.strip().startswith("{") and content.strip().endswith("}"):
+                            try:
+                                parsed_content = json.loads(content)
+                            except Exception:
+                                parsed_content = None
+
+                        source_dict = parsed_content if isinstance(parsed_content, dict) else payload
+                        kind = source_dict.get("kind", payload.get("kind", "text"))
+                        data_b64 = source_dict.get("data_b64") or source_dict.get("dataBase64") or payload.get("data_b64")
+                        file_name = source_dict.get("file_name") or source_dict.get("fileName") or payload.get("file_name")
+
+                        if kind in ("image", "diagram") and data_b64:
+                            img_bytes = base64.b64decode(data_b64.encode("ascii"))
+                            if len(img_bytes) > 10 * 1024 * 1024:
+                                _send_sync_http(client, "413 Payload Too Large", {"status": "error", "error": "Image exceeds 10 MB limit"})
+                                return
+                            ok_i, dims, _ = security_guard.validate_image_binary("PNG", img_bytes)
+                            if ok_i:
+                                img_bundle = {
+                                    "ok": True,
+                                    "kind": "image",
+                                    "action": "copy",
+                                    "text": f"Image [{dims[0]}x{dims[1]}]",
+                                    "files": [],
+                                    "formats": {"PNG": img_bytes},
+                                    "dimensions": dims
+                                }
+                                from ratt.clipboard_manager import ClipboardSlot, SlotAction
+                                with clipboard_manager._lock:
+                                    old = clipboard_manager._slots.get(slot_id)
+                                    if old:
+                                        old.wipe()
+                                    clipboard_manager._slots[slot_id] = ClipboardSlot(
+                                        timestamp=datetime.now(), action=SlotAction.COPY, bundle=img_bundle
+                                    )
+                        elif (kind == "files" or (file_name and "." in str(file_name))) and data_b64:
+                            # WIN-01: Validate filename, extension, and size IN MEMORY before writing to disk
+                            fname = os.path.basename(str(file_name or ""))
+                            if not _is_safe_inbound_filename(fname):
+                                _send_sync_http(client, "403 Forbidden", {"status": "error", "error": "Blocked file type or unsafe filename"})
+                                return
+                            file_bytes = base64.b64decode(data_b64.encode("ascii"))
+                            if len(file_bytes) > MAX_SYNC_FILE_BYTES:
+                                _send_sync_http(client, "413 Payload Too Large", {"status": "error", "error": "File exceeds 25 MB limit"})
+                                return
+                            base_dir = os.path.join(os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~"), "RATT", "spool")
+                            os.makedirs(base_dir, exist_ok=True)
+                            dest = os.path.join(base_dir, f"and_{secrets.token_hex(4)}_{fname}")
+                            with open(dest, "wb") as f:
+                                f.write(file_bytes)
+                            stored_ok = False
+                            try:
+                                res = clipboard_manager.store_files_to_slot(slot_id, [dest])
+                                stored_ok = bool(res[0] if isinstance(res, tuple) else res)
+                            finally:
+                                if not stored_ok and os.path.exists(dest):
+                                    try:
+                                        os.remove(dest)
+                                    except OSError:
+                                        pass
+                        else:
+                            text_val = source_dict.get("text") or content
+                            if isinstance(text_val, dict):
+                                text_val = json.dumps(text_val)
+                            ok_t, clean_t, _, err_t = security_guard.sanitize_unformatted_text_and_links(str(text_val))
+                            if not ok_t:
+                                _send_sync_http(client, "400 Bad Request", {"status": "error", "error": err_t or "Unsafe payload blocked"})
+                                return
+                            clipboard_manager.copy_to_slot(slot_id, text=clean_t)
+
+                        if hasattr(clipboard_manager, "_notify_listeners"):
+                            clipboard_manager._notify_listeners()
+                        if hasattr(clipboard_manager, "app") and clipboard_manager.app:
+                            clipboard_manager.app._clip_dirty = True
+                    except Exception:
+                        pass
+
+                try:
+                    slot_obj = clipboard_manager.get_slot(slot_id)
+                    if slot_obj and not slot_obj.is_empty:
+                        from ratt.hal import win32
+                        win32.write_clipboard_bundle(slot_obj.get_bundle())
+                except Exception:
+                    pass
+
+            _send_sync_http(client, "200 OK", resp_obj)
+        else:
+            _send_sync_http(client, "401 Unauthorized", {"status": "error", "error": "Authentication required"})
+    except Exception:
+        pass
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def start_pc_sync_receiver(clipboard_manager, port: int = 49210):
+    """Start authenticated background socket/HTTP server on PC for Android sync (Port 49210)."""
     global _pc_receiver_running
     if _pc_receiver_running:
         return
     _pc_receiver_running = True
+
+    import threading
 
     def listen_on_port(p: int):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -662,198 +1129,14 @@ def start_pc_sync_receiver(clipboard_manager, port: int = 49211):
         while True:
             try:
                 client, addr = srv.accept()
-                threading.Thread(target=handle_client, args=(client, addr), daemon=True).start()
+                threading.Thread(
+                    target=_handle_pc_sync_client,
+                    args=(client, addr, clipboard_manager),
+                    daemon=True,
+                ).start()
             except Exception:
                 pass
 
-    def handle_client(client, addr):
-        try:
-            if addr and addr[0] and addr[0] not in ("127.0.0.1", "localhost"):
-                set_paired_android_ip(addr[0])
-            client.settimeout(2.5)
-            raw = b""
-            while len(raw) < 65536:
-                try:
-                    chunk = client.recv(4096)
-                    if not chunk:
-                        break
-                    raw += chunk
-                    if b"\r\n\r\n" in raw:
-                        headers_part, body_part = raw.split(b"\r\n\r\n", 1)
-                        content_len = 0
-                        for line in headers_part.split(b"\r\n"):
-                            if line.lower().startswith(b"content-length:"):
-                                try:
-                                    content_len = int(line.split(b":", 1)[1].strip())
-                                except Exception:
-                                    pass
-                        while len(body_part) < content_len:
-                            more = client.recv(min(4096, content_len - len(body_part)))
-                            if not more:
-                                break
-                            body_part += more
-                        body = body_part.decode("utf-8", errors="ignore")
-                        break
-                    elif not raw.startswith(b"POST ") and not raw.startswith(b"GET "):
-                        body = raw.decode("utf-8", errors="ignore")
-                        break
-                except Exception:
-                    break
-            else:
-                body = raw.decode("utf-8", errors="ignore")
-
-            if body:
-                try:
-                    payload = json.loads(body)
-                except Exception:
-                    payload = {}
-
-                action = (payload.get("action") or "").upper()
-                content = payload.get("content", "")
-                raw_slot = payload.get("slot_id") or payload.get("slot") or 1
-                try:
-                    slot_id = int(raw_slot)
-                except Exception:
-                    slot_id = 1
-
-                resp_obj = {"status": "ok"}
-                cfg = getattr(clipboard_manager, "config", None)
-                if cfg and hasattr(cfg, "user") and hasattr(cfg.user, "tier"):
-                    resp_obj["tier"] = cfg.user.tier.value
-
-                if action in ("CROSS_SYNC_IOS", "CROSS_SYNC_MACOS"):
-                    is_prem = bool(cfg and getattr(cfg, "is_premium", False))
-                    if not is_prem:
-                        resp_obj = {"status": "error", "error": UPGRADE_CROSS_SYNC_MSG, "upgrade_required": True}
-                    else:
-                        resp_obj["status"] = "ok"
-
-                elif action in ("CLEAR_SLOT", "CLEAR", "DELETE"):
-                    # Explicit user deletion command
-                    try:
-                        clipboard_manager.clear_slot(slot_id)
-                        if hasattr(clipboard_manager, "_notify_listeners"):
-                            clipboard_manager._notify_listeners()
-                        if hasattr(clipboard_manager, "app") and clipboard_manager.app:
-                            clipboard_manager.app._clip_dirty = True
-                            if hasattr(clipboard_manager.app, "root"):
-                                clipboard_manager.app.root.after(0, clipboard_manager.app._refresh_slots)
-                    except Exception:
-                        pass
-
-                elif not content and action in ("SYNC_FROM_PHONE", "SYNC_FROM_ANDROID", "PUSH_ALL_SLOTS"):
-                    cur = clipboard_manager.get_slot(slot_id)
-                    # Ambient or passive sync without content must never clear local PC slots!
-                    # Instead, push local PC content back to mobile if available
-                    if cur and not cur.is_empty:
-                        try:
-                            clipboard_manager.copy_to_android(slot_id)
-                        except Exception:
-                            pass
-
-                elif action in ("CLEAR_ALL", "CLEARALL", "DELETE_ALL"):
-                    try:
-                        clipboard_manager.clear_all()
-                        if hasattr(clipboard_manager, "_notify_listeners"):
-                            clipboard_manager._notify_listeners()
-                        if hasattr(clipboard_manager, "app") and clipboard_manager.app:
-                            clipboard_manager.app._clip_dirty = True
-                            if hasattr(clipboard_manager.app, "root"):
-                                clipboard_manager.app.root.after(0, clipboard_manager.app._refresh_slots)
-                    except Exception:
-                        pass
-
-                elif content and (action in ("SYNC_FROM_PHONE", "SYNC_FROM_ANDROID", "PUSH_ALL_SLOTS", "CROSS_SYNC") or not action):
-                    cur = clipboard_manager.get_slot(slot_id)
-                    from ratt.clipboard_manager import SlotContentType
-                    # Never overwrite an active FILES/IMAGE/DIAGRAM slot with reflected text from mobile
-                    if cur and cur.content_type in (SlotContentType.FILES, SlotContentType.IMAGE, SlotContentType.DIAGRAM) and (
-                        content.startswith("[FILE]") or (cur.timestamp and (datetime.now() - cur.timestamp).total_seconds() < 5.0)
-                    ):
-                        pass
-                    else:
-                        try:
-                            # 1. Determine kind and attributes from payload or content JSON
-                            parsed_content = None
-                            if isinstance(content, str) and content.strip().startswith("{") and content.strip().endswith("}"):
-                                try:
-                                    parsed_content = json.loads(content)
-                                except Exception:
-                                    parsed_content = None
-
-                            source_dict = parsed_content if isinstance(parsed_content, dict) else payload
-                            kind = source_dict.get("kind", payload.get("kind", "text"))
-                            data_b64 = source_dict.get("data_b64") or source_dict.get("dataBase64") or payload.get("data_b64")
-                            file_name = source_dict.get("file_name") or source_dict.get("fileName") or payload.get("file_name")
-
-                            if kind in ("image", "diagram") and data_b64:
-                                img_bytes = base64.b64decode(data_b64.encode("ascii"))
-                                ok_i, dims, _ = security_guard.validate_image_binary("PNG", img_bytes)
-                                if ok_i:
-                                    img_bundle = {
-                                        "ok": True,
-                                        "kind": "image",
-                                        "action": "copy",
-                                        "text": f"Image [{dims[0]}x{dims[1]}]",
-                                        "files": [],
-                                        "formats": {"PNG": img_bytes},
-                                        "dimensions": dims
-                                    }
-                                    from ratt.clipboard_manager import ClipboardSlot, SlotAction
-                                    with clipboard_manager._lock:
-                                        old = clipboard_manager._slots.get(slot_id)
-                                        if old:
-                                            old.wipe()
-                                        clipboard_manager._slots[slot_id] = ClipboardSlot(
-                                            timestamp=datetime.now(), action=SlotAction.COPY, bundle=img_bundle
-                                        )
-                            elif (kind == "files" or (file_name and "." in str(file_name))) and data_b64:
-                                file_bytes = base64.b64decode(data_b64.encode("ascii"))
-                                fname = os.path.basename(file_name or "android_doc.bin")
-                                base_dir = os.path.join(os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~"), "RATT", "spool")
-                                os.makedirs(base_dir, exist_ok=True)
-                                dest = os.path.join(base_dir, f"and_{secrets.token_hex(4)}_{fname}")
-                                with open(dest, "wb") as f:
-                                    f.write(file_bytes)
-                                clipboard_manager.store_files_to_slot(slot_id, [dest])
-                            else:
-                                text_val = source_dict.get("text") or content
-                                if isinstance(text_val, dict):
-                                    text_val = json.dumps(text_val)
-                                clipboard_manager.copy_to_slot(slot_id, text=str(text_val))
-
-                            if hasattr(clipboard_manager, "_notify_listeners"):
-                                clipboard_manager._notify_listeners()
-                            if hasattr(clipboard_manager, "app") and clipboard_manager.app:
-                                clipboard_manager.app._clip_dirty = True
-                        except Exception:
-                            pass
-
-                    # Also set Windows system clipboard so user can immediately Ctrl+V
-                    try:
-                        slot_obj = clipboard_manager.get_slot(slot_id)
-                        if slot_obj and not slot_obj.is_empty:
-                            from ratt.hal import win32
-                            win32.write_clipboard_bundle(slot_obj.get_bundle())
-                        elif content:
-                            import pyperclip
-                            pyperclip.copy(content)
-                    except Exception:
-                        pass
-
-            resp_bytes = json.dumps(resp_obj).encode("utf-8")
-            resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n" + resp_bytes
-            client.sendall(resp)
-        except Exception:
-            pass
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
-
-    import threading
-    t1 = threading.Thread(target=lambda: listen_on_port(port), daemon=True, name="RattPcSyncReceiver49211")
-    t1.start()
-    t2 = threading.Thread(target=lambda: listen_on_port(49210), daemon=True, name="RattPcSyncReceiver49210")
-    t2.start()
+    # COM-05: Bind only dedicated Android port (49210) so port 49211 remains exclusively for IOSBridge
+    t_android = threading.Thread(target=lambda: listen_on_port(port), daemon=True, name="RattPcSyncReceiver49210")
+    t_android.start()

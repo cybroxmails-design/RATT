@@ -60,9 +60,11 @@ def hand_over(action):
                     f.write("\t".join(action))
         except Exception:
             pass
-        # Also attempt instant delivery via daemon helper if available
-        daemon_link.send_command("ACTION " + " ".join(action[:3]))
-    instance.request_show()
+        # Also attempt instant delivery via daemon helper if available (only when no file path argument is attached)
+        if len(action) <= 2:
+            daemon_link.send_command("ACTION " + " ".join(action[:2]))
+    bring_front = not action or action[0] == "open"
+    instance.request_show(bring_to_front=bring_front)
 
 
 def main():

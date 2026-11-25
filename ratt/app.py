@@ -726,8 +726,34 @@ class RattApp:
     
     def _paste_slot(self, slot_num):
         """Paste from a slot."""
+        from ratt.clipboard_manager import SlotAction, SlotContentType
+        slot_obj = self.clipboard_manager.get_slot(slot_num)
         result = self.clipboard_manager.paste_from_slot(slot_num)
         if result:
+            if slot_obj and slot_obj.content_type == SlotContentType.FILES:
+                target_dir = None
+                if hasattr(self, "daemon") and self.daemon:
+                    exp_folder, _ = self.daemon.query_explorer_context(None)
+                    if exp_folder and os.path.isdir(exp_folder):
+                        target_dir = exp_folder
+                if not target_dir:
+                    from tkinter import filedialog
+                    target_dir = filedialog.askdirectory(
+                        title=f"Select Destination Folder to Paste Slot #{slot_num} File(s)",
+                        parent=self.root,
+                    )
+                if target_dir and os.path.isdir(target_dir):
+                    from ratt.actions import _safe_copy_or_move_files
+                    is_cut = slot_obj.action == SlotAction.CUT
+                    ok, msg = _safe_copy_or_move_files(slot_obj.files, target_dir, is_cut=is_cut)
+                    if ok:
+                        if is_cut:
+                            self.clipboard_manager.clear_slot(slot_num)
+                            self._refresh_slots()
+                        self.show_notification(f"Slot #{slot_num}: {msg}")
+                    else:
+                        self.show_notification(msg, is_error=True)
+                    return
             self.show_notification(f"Pasted from Slot #{slot_num}")
         elif self.clipboard_manager.last_error:
             err = self.clipboard_manager.last_error
@@ -747,26 +773,137 @@ class RattApp:
             self.clipboard_manager.clear_all()
             self._refresh_slots()
 
-    def _prompt_pair_android(self):
-        """Allow user to view or change the paired phone IP address anytime."""
+    def _show_android_pair_dialog(self, initial_ip: str = "", err_msg: Optional[str] = None):
+        """Show a unified secure PC <-> Android PIN pairing dialog (works in either direction)."""
         from ratt.hal import android_bridge
-        from tkinter import simpledialog
+        import threading
+        import tkinter as tk
+
         pc_ip, gw_ip = android_bridge.get_wifi_network_info()
-        current_ip = android_bridge.get_paired_android_ip()
-        default_val = current_ip if current_ip and current_ip != "127.0.0.1" else (gw_ip or "")
-        
-        msg = (
-            f"PAIR RATT PC WITH ANDROID PHONE\n\n"
-            f"1. Your PC's Local IP Address is: {pc_ip or '192.168.100.4'}\n"
-            f"   (On your phone in RATT, tap 'Connected PC IP' and set it to: {pc_ip or '192.168.100.4'})\n\n"
-            f"2. Look at your phone screen in RATT under 'THIS PHONE IP ADDRESS':\n"
-            f"   Enter that IP address below to connect:"
+        current_ip = initial_ip or android_bridge.get_paired_android_ip()
+        default_ip = current_ip if current_ip and current_ip not in ("127.0.0.1", "localhost") else (gw_ip or "")
+        pc_pin = android_bridge.generate_pairing_pin()
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Pair Android Phone (Secure PIN)")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(True, True)
+
+        # Pack bottom buttons and status bar FIRST so they can NEVER be clipped at any DPI scaling
+        bottom_bar = tk.Frame(dlg, padx=18, pady=12, bg="#f1f5f9")
+        bottom_bar.pack(side="bottom", fill="x")
+
+        pair_btn = tk.Button(
+            bottom_bar,
+            text="Pair Now",
+            width=14,
+            bg="#0284c7",
+            fg="white",
+            activebackground="#0369a1",
+            activeforeground="white",
+            font=("Segoe UI", 10, "bold"),
+            cursor="hand2",
         )
-        new_ip = simpledialog.askstring("Pair Android Phone", msg, initialvalue=default_val, parent=self.root)
-        if new_ip and new_ip.strip():
-            android_bridge.set_paired_android_ip(new_ip.strip())
-            self.show_notification(f"Saved Phone IP: {new_ip.strip()}. Syncing...")
-            self.root.after(100, self._on_android_sync_btn)
+        close_btn = tk.Button(bottom_bar, text="Close", command=dlg.destroy, width=10, font=("Segoe UI", 10))
+        pair_btn.pack(side="right", padx=(8, 0))
+        close_btn.pack(side="right")
+
+        status_var = tk.StringVar(value="Enter the Phone 6-Digit PIN shown on Android, then click Pair Now (or press Enter).")
+        status_lbl = tk.Label(
+            dlg,
+            textvariable=status_var,
+            fg="#0369a1",
+            font=("Segoe UI", 9, "bold"),
+            justify="left",
+            anchor="w",
+            wraplength=500,
+            padx=18,
+            pady=4,
+        )
+        status_lbl.pack(side="bottom", fill="x")
+
+        frame = tk.Frame(dlg, padx=18, pady=12)
+        frame.pack(side="top", fill="both", expand=True)
+
+        if err_msg:
+            tk.Label(
+                frame,
+                text=f"Pairing required ({err_msg})",
+                fg="#b91c1c",
+                font=("Segoe UI", 9, "bold"),
+                justify="left",
+                anchor="w",
+                wraplength=500,
+            ).pack(fill="x", pady=(0, 8))
+
+        info_text = (
+            f"Option A (From Phone): On Android -> tap 'Pair with PC'\n"
+            f"   Enter PC IP: {pc_ip or '<your-pc-ip>'}   and   PC PIN: {pc_pin}  (valid 5 min)\n\n"
+            f"Option B (From PC): Enter your Phone IP and the Phone's 6-digit PIN\n"
+            f"   (shown inside Android's 'Pair with PC' popup), then click Pair Now:"
+        )
+        tk.Label(frame, text=info_text, font=("Segoe UI", 9), justify="left", anchor="w", wraplength=500).pack(fill="x", pady=(0, 10))
+
+        row1 = tk.Frame(frame)
+        row1.pack(fill="x", pady=4)
+        tk.Label(row1, text="Phone IP Address:", width=18, anchor="w", font=("Segoe UI", 9, "bold")).pack(side="left")
+        ip_var = tk.StringVar(value=default_ip)
+        ip_entry = tk.Entry(row1, textvariable=ip_var, width=28, font=("Consolas", 10))
+        ip_entry.pack(side="left", fill="x", expand=True)
+
+        row2 = tk.Frame(frame)
+        row2.pack(fill="x", pady=4)
+        tk.Label(row2, text="Phone 6-Digit PIN:", width=18, anchor="w", font=("Segoe UI", 9, "bold")).pack(side="left")
+        pin_var = tk.StringVar(value="")
+        pin_entry = tk.Entry(row2, textvariable=pin_var, width=28, font=("Consolas", 10))
+        pin_entry.pack(side="left", fill="x", expand=True)
+
+        def on_pair_now(_event=None):
+            target_ip = ip_var.get().strip()
+            entered_pin = pin_var.get().strip()
+            if not target_ip:
+                status_var.set("Please enter your Android Phone's IP address.")
+                return
+            android_bridge.set_paired_android_ip(target_ip)
+            if not entered_pin:
+                status_var.set(f"Saved Phone IP ({target_ip}). Enter PC PIN {pc_pin} on Android, or enter Phone PIN above.")
+                return
+            if entered_pin == pc_pin:
+                status_var.set("That is the PC PIN. Enter the Phone's PIN shown on Android (or enter this PC PIN on Android).")
+                return
+            pair_btn.config(state="disabled", text="Pairing...")
+            status_var.set(f"Pairing with {target_ip}:49210...")
+
+            def _do_pair():
+                ok, msg = android_bridge.pair_with_android_device(target_ip, pin=entered_pin)
+                def _finish():
+                    if not dlg.winfo_exists():
+                        return
+                    pair_btn.config(state="normal", text="Pair Now")
+                    if ok:
+                        dlg.destroy()
+                        self.show_notification(msg)
+                        self.root.after(150, self._on_android_sync_btn)
+                    else:
+                        status_lbl.config(fg="#b91c1c")
+                        status_var.set(msg)
+                self.root.after(0, _finish)
+
+            threading.Thread(target=_do_pair, daemon=True).start()
+
+        pair_btn.config(command=on_pair_now)
+        for widget in (dlg, ip_entry, pin_entry):
+            widget.bind("<Return>", on_pair_now)
+            widget.bind("<KP_Enter>", on_pair_now)
+
+        dlg.minsize(520, 380)
+        dlg.geometry("560x420")
+        pin_entry.focus_set()
+
+    def _prompt_pair_android(self):
+        """Allow user to pair securely with Android using a 6-digit Pairing PIN."""
+        self._show_android_pair_dialog()
 
     def _on_android_sync_btn(self):
         """Handle Android Sync button click from the main toolbar."""
@@ -795,11 +932,15 @@ class RattApp:
         import urllib.request
         pulled_count = 0
         cleared_count = 0
+        cleared_slots = []
         phone_slots = {}
         pull_err = None
         try:
             url = f"http://{paired_ip}:49210/get_all_slots"
-            req = urllib.request.Request(url, headers={"User-Agent": "RATT-PC"})
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "RATT-PC", "X-RATT-Token": android_bridge.get_pc_sync_token()},
+            )
             with urllib.request.urlopen(req, timeout=5.0) as resp:
                 raw_resp = resp.read().decode("utf-8")
                 data = json.loads(raw_resp)
@@ -833,7 +974,10 @@ class RattApp:
             if gw_ip and gw_ip != paired_ip:
                 try:
                     url = f"http://{gw_ip}:49210/get_all_slots"
-                    req = urllib.request.Request(url, headers={"User-Agent": "RATT-PC"})
+                    req = urllib.request.Request(
+                        url,
+                        headers={"User-Agent": "RATT-PC", "X-RATT-Token": android_bridge.get_pc_sync_token()},
+                    )
                     with urllib.request.urlopen(req, timeout=4.0) as resp:
                         raw_resp = resp.read().decode("utf-8")
                         data = json.loads(raw_resp)
@@ -866,20 +1010,8 @@ class RattApp:
                     pass
 
             if pull_err:
-                from tkinter import simpledialog
-                new_ip = simpledialog.askstring(
-                    "Pair Android Phone",
-                    f"Connection to Phone ({paired_ip}) failed ({pull_err}).\n\n"
-                    f"Your PC is on IP: {pc_ip or 'unknown'}\n"
-                    f"{f'Detected Hotspot Phone IP: {gw_ip}' if gw_ip else ''}\n\n"
-                    f"Enter the Phone IP address shown on your RATT phone screen:",
-                    initialvalue=gw_ip or paired_ip,
-                    parent=self.root
-                )
-                if new_ip and new_ip.strip():
-                    android_bridge.set_paired_android_ip(new_ip.strip())
-                    self.root.after(100, self._on_android_sync_btn)
-                    return
+                self._show_android_pair_dialog(initial_ip=gw_ip or paired_ip, err_msg=pull_err)
+                return
 
         # 2. Push PC slots to Phone if phone slot is empty or different
         pc_slots = self.clipboard_manager.get_all_slots()
@@ -1117,7 +1249,10 @@ class RattApp:
                     if not paired_ip or paired_ip in ("127.0.0.1", "localhost"):
                         continue
                     url = f"http://{paired_ip}:49210/get_all_slots"
-                    req = urllib.request.Request(url, headers={"User-Agent": "RATT-PC-AutoSync"})
+                    req = urllib.request.Request(
+                        url,
+                        headers={"User-Agent": "RATT-PC-AutoSync", "X-RATT-Token": android_bridge.get_pc_sync_token()},
+                    )
                     with urllib.request.urlopen(req, timeout=1.2) as resp:
                         raw = resp.read().decode("utf-8")
                         data = json.loads(raw)
@@ -1282,27 +1417,27 @@ class RattApp:
             self._show_requested = True
 
     def _poll(self):
+        # Always check for background context menu action handed over from another process
+        consumed_action = False
+        try:
+            appdata = os.environ.get("APPDATA", "")
+            if appdata:
+                p_file = os.path.join(appdata, "RATT", "pending_action.txt")
+                if os.path.exists(p_file):
+                    with open(p_file, "r", encoding="utf-8", errors="replace") as f:
+                        content = f.read().strip()
+                    try:
+                        os.remove(p_file)
+                    except Exception:
+                        pass
+                    if content:
+                        tokens = content.split("\t")
+                        self.queue_action(tokens[0], tokens[1:])
+                        consumed_action = True
+        except Exception:
+            pass
         if self._show_requested:
             self._show_requested = False
-            # Check for background context menu action handed over from another process
-            consumed_action = False
-            try:
-                appdata = os.environ.get("APPDATA", "")
-                if appdata:
-                    p_file = os.path.join(appdata, "RATT", "pending_action.txt")
-                    if os.path.exists(p_file):
-                        with open(p_file, "r", encoding="utf-8", errors="replace") as f:
-                            content = f.read().strip()
-                        try:
-                            os.remove(p_file)
-                        except Exception:
-                            pass
-                        if content:
-                            tokens = content.split("\t")
-                            self.queue_action(tokens[0], tokens[1:])
-                            consumed_action = True
-            except Exception:
-                pass
             if not consumed_action:
                 self.show_main_window()
         if self._clip_dirty:

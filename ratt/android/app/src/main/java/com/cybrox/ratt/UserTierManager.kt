@@ -115,8 +115,13 @@ object UserTierManager {
      */
     fun isAllowedPayloadForTier(context: Context, payloadText: String): Boolean {
         if (hasPaidEntitlement(context)) return true
-        if (payloadText.startsWith("[FILE]")) return true
         val trimmed = payloadText.trim().lowercase()
+        // COM-06: Never unconditionally allow [FILE] payloads on Basic tier
+        if (trimmed.startsWith("[file]")) {
+            for (ext in DOCUMENT_AND_MEDIA_EXTENSIONS) {
+                if (trimmed.endsWith(ext)) return false
+            }
+        }
         for (ext in DOCUMENT_AND_MEDIA_EXTENSIONS) {
             if (trimmed.endsWith(ext) && (trimmed.startsWith("file://") || trimmed.contains("/") || trimmed.contains("\\"))) {
                 return false

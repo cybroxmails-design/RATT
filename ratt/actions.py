@@ -14,22 +14,46 @@ from typing import List, Optional, Tuple
 
 import pyperclip
 
-from ratt import security_guard, win_clipboard
+from ratt import hal, security_guard, win_clipboard
 from ratt.clipboard_manager import SlotAction, SlotContentType
 from ratt.config import config, TRANSLATE_LANGUAGES
 from ratt.translation import TranslationError
 
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-_user32.GetForegroundWindow.restype = wintypes.HWND
-_user32.GetForegroundWindow.argtypes = []
+if os.name == "nt":
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.GetForegroundWindow.argtypes = []
+    _user32.GetClassNameW.restype = ctypes.c_int
+    _user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+else:
+    _user32 = None
 
 
 def _get_foreground_window() -> int:
     """Return the HWND of the current foreground window."""
+    if not _user32:
+        return 0
     try:
         return int(_user32.GetForegroundWindow() or 0)
     except Exception:
         return 0
+
+
+def _get_window_class(hwnd: int) -> str:
+    if not _user32 or not hwnd:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(64)
+        if _user32.GetClassNameW(wintypes.HWND(hwnd), buf, 63) > 0:
+            return buf.value
+    except Exception:
+        pass
+    return ""
+
+
+def _is_explorer_or_desktop_window(hwnd: int) -> bool:
+    cls = _get_window_class(hwnd)
+    return cls in ("CabinetWClass", "ExploreWClass", "Progman", "WorkerW")
 
 
 def _consume_shell_context(max_age_sec: float = 10.0, path: Optional[str] = None) -> Tuple[Optional[str], List[str]]:
@@ -258,13 +282,15 @@ class ActionRunner:
         if slot is None or slot > config.max_slots:
             self.app.show_notification("That slot is not available on your plan", is_error=True)
             return
-        extra_path = None
+        extra_paths = []
         if len(args) > 1:
-            candidate = args[1].strip().strip('"')
-            if candidate and os.path.exists(candidate):
-                extra_path = candidate
+            for raw_arg in args[1:]:
+                candidate = str(raw_arg).strip().strip('"')
+                if candidate and os.path.exists(candidate):
+                    extra_paths.append(candidate)
+        extra_arg = extra_paths if extra_paths else None
         work = self._paste_into_document if action == "paste" else self._grab_to_slot
-        threading.Thread(target=work, args=(action, slot, 0.3, extra_path), daemon=True).start()
+        threading.Thread(target=work, args=(action, slot, 0.3, extra_arg), daemon=True).start()
 
     def _hotkey_action(self, action, args):
         """Hotkey chord: the helper already sent Ctrl+C / Ctrl+X, or held back Ctrl+V."""
@@ -281,8 +307,29 @@ class ActionRunner:
 
     def _store_clipboard(self, action, slot):
         """The document/Explorer just copied or cut: capture the multi-format clipboard into the slot."""
+        fg_hwnd = _get_foreground_window()
         time.sleep(0.15)
         manager = self.app.clipboard_manager
+
+        # If the user is in Windows File Explorer or macOS Finder, verify whether CF_HDROP / FileURL
+        # is on the clipboard; if not, query the active Explorer/Finder selection directly.
+        if _is_explorer_or_desktop_window(fg_hwnd) or os.name != "nt":
+            bundle = hal.get_platform().read_clipboard_bundle(default_action=action)
+            if bundle.get("kind") != "files" and hasattr(self.app, "daemon"):
+                _, exp_files = self.app.daemon.query_explorer_context(fg_hwnd)
+                if exp_files:
+                    if manager.store_files_to_slot(slot, exp_files, action=action):
+                        slot_obj = manager.get_slot(slot)
+                        if slot_obj:
+                            hal.get_platform().write_clipboard_bundle(slot_obj.get_bundle())
+                        badge = f"[{slot_obj.type_badge}] " if slot_obj else ""
+                        self.app.notify_async(
+                            f"{'Copied' if action == 'copy' else 'Cut'} {badge}to Slot #{slot}"
+                        )
+                    elif manager.last_error:
+                        self._report_error(manager.last_error)
+                    return
+
         store = manager.copy_to_slot if action == "copy" else manager.cut_to_slot
         if store(slot):
             slot_obj = manager.get_slot(slot)
@@ -295,20 +342,29 @@ class ActionRunner:
         """Copy/cut the highlighted text, image, diagram, link, or Explorer files into a slot."""
         manager = self.app.clipboard_manager
 
-        # 1. Direct file path passed as argument (e.g. from fallback registry verb)
-        if direct_file and os.path.exists(direct_file):
-            if manager.store_files_to_slot(slot, [direct_file], action=action):
-                self.app.notify_async(
-                    f"{'Copied' if action == 'copy' else 'Cut'} 1 file to Slot #{slot}"
-                )
-            else:
-                self._report_error(manager.last_error, "Blocked unsafe file selection")
-            return
+        # 1. Direct file path(s) passed as argument (e.g. from fallback registry verb or macOS FinderSync)
+        if direct_file:
+            direct_list = direct_file if isinstance(direct_file, list) else [direct_file]
+            valid_direct = [p for p in direct_list if p and os.path.exists(p)]
+            if valid_direct:
+                if manager.store_files_to_slot(slot, valid_direct, action=action):
+                    slot_obj = manager.get_slot(slot)
+                    if slot_obj:
+                        hal.get_platform().write_clipboard_bundle(slot_obj.get_bundle())
+                    self.app.notify_async(
+                        f"{'Copied' if action == 'copy' else 'Cut'} {len(valid_direct)} file(s) to Slot #{slot}"
+                    )
+                else:
+                    self._report_error(manager.last_error, "Blocked unsafe file selection")
+                return
 
         # 2. Check if invoked from Explorer right-click menu with selected files
         _, shell_files = _consume_shell_context()
         if shell_files:
             if manager.store_files_to_slot(slot, shell_files, action=action):
+                slot_obj = manager.get_slot(slot)
+                if slot_obj:
+                    hal.get_platform().write_clipboard_bundle(slot_obj.get_bundle())
                 self.app.notify_async(
                     f"{'Copied' if action == 'copy' else 'Cut'} {len(shell_files)} file(s) to Slot #{slot}"
                 )
@@ -318,27 +374,54 @@ class ActionRunner:
 
         time.sleep(min(delay, 0.08))           # let context menu/popup dismiss
         hwnd_target = _get_foreground_window() # capture target document window
+
+        # 3. If the target window is Windows File Explorer or macOS Finder, check active file selection directly
+        if (_is_explorer_or_desktop_window(hwnd_target) or os.name != "nt") and hasattr(self.app, "daemon"):
+            _, exp_files = self.app.daemon.query_explorer_context(hwnd_target)
+            if exp_files:
+                if manager.store_files_to_slot(slot, exp_files, action=action):
+                    slot_obj = manager.get_slot(slot)
+                    if slot_obj:
+                        hal.get_platform().write_clipboard_bundle(slot_obj.get_bundle())
+                    badge = f"[{slot_obj.type_badge}] " if slot_obj else ""
+                    self.app.notify_async(
+                        f"{'Copied' if action == 'copy' else 'Cut'} {badge}({len(exp_files)} file(s)) to Slot #{slot}"
+                    )
+                else:
+                    self._report_error(manager.last_error, "Blocked unsafe file selection")
+                return
+
         if delay > 0.08:
             time.sleep(delay - 0.08)
         if hwnd_target and _get_foreground_window() != hwnd_target:
             self.app.notify_async("Action cancelled: active window changed", is_error=True)
             return
 
-        seq_before = win_clipboard.get_sequence_number()
+        seq_before = hal.get_platform().get_sequence_number()
         self.app.daemon.send_keys("ctrl+c" if action == "copy" else "ctrl+x")
 
         changed = False
         for _ in range(15):                    # wait up to 1.5 s for the app/Explorer to update clipboard
             time.sleep(0.1)
-            if win_clipboard.get_sequence_number() != seq_before:
+            if hal.get_platform().get_sequence_number() != seq_before:
                 changed = True
                 break
 
+        store = manager.copy_to_slot if action == "copy" else manager.cut_to_slot
         if not changed:
+            # If the user already copied files onto the OS clipboard, allow capturing them
+            cur_bundle = hal.get_platform().read_clipboard_bundle(default_action=action)
+            if cur_bundle.get("ok") and cur_bundle.get("kind") == "files":
+                if store(slot):
+                    slot_obj = manager.get_slot(slot)
+                    badge = f"[{slot_obj.type_badge}] " if slot_obj else ""
+                    self.app.notify_async(f"{'Copied' if action == 'copy' else 'Cut'} {badge}to Slot #{slot}")
+                else:
+                    self._report_error(manager.last_error, "Nothing valid copied")
+                return
             self.app.notify_async("Highlight text, image, or files first", is_error=True)
             return
 
-        store = manager.copy_to_slot if action == "copy" else manager.cut_to_slot
         if store(slot):
             slot_obj = manager.get_slot(slot)
             badge = f"[{slot_obj.type_badge}] " if slot_obj else ""
@@ -358,15 +441,37 @@ class ActionRunner:
             self._report_error(UPGRADE_FILES_MSG)
             return
 
-        # Check if direct folder path was provided or invoked from Explorer right-click menu
-        shell_folder, _ = _consume_shell_context()
+        # 1. Check if direct folder/file path was provided or invoked from Explorer right-click menu
+        shell_folder, shell_files = _consume_shell_context()
         dest_folder = None
-        if direct_target and os.path.isdir(direct_target):
-            dest_folder = direct_target
-        elif shell_folder and os.path.isdir(shell_folder):
+        if direct_target:
+            target_cand = direct_target[0] if isinstance(direct_target, list) else direct_target
+            if target_cand and os.path.isdir(target_cand):
+                dest_folder = target_cand
+            elif target_cand and os.path.isfile(target_cand):
+                dest_folder = os.path.dirname(target_cand)
+        if not dest_folder and shell_folder and os.path.isdir(shell_folder):
             dest_folder = shell_folder
+        if not dest_folder and shell_files:
+            if len(shell_files) == 1 and os.path.isdir(shell_files[0]):
+                dest_folder = shell_files[0]
+            elif os.path.exists(shell_files[0]):
+                dest_folder = os.path.dirname(shell_files[0])
+
+        time.sleep(min(delay, 0.05))
+        hwnd_target = _get_foreground_window() # capture target document/Explorer window
+
+        # 2. If pasting a FILES slot and dest_folder isn't set yet, inspect the active Explorer/Desktop/Finder window
+        if not dest_folder and slot_obj.content_type == SlotContentType.FILES and hasattr(self.app, "daemon"):
+            if _is_explorer_or_desktop_window(hwnd_target) or os.name != "nt":
+                exp_folder, exp_files = self.app.daemon.query_explorer_context(hwnd_target)
+                if exp_files and len(exp_files) == 1 and os.path.isdir(exp_files[0]):
+                    dest_folder = exp_files[0]
+                elif exp_folder and os.path.isdir(exp_folder):
+                    dest_folder = exp_folder
 
         if dest_folder and slot_obj.content_type == SlotContentType.FILES:
+            manager.paste_from_slot(slot)
             is_cut = slot_obj.action == SlotAction.CUT
             ok, msg = _safe_copy_or_move_files(slot_obj.files, dest_folder, is_cut=is_cut)
             if ok:
@@ -377,8 +482,6 @@ class ActionRunner:
                 self._report_error(msg)
             return
 
-        time.sleep(min(delay, 0.05))
-        hwnd_target = _get_foreground_window() # capture target document window
         if delay > 0.05:
             time.sleep(delay - 0.05)
         if hwnd_target and _get_foreground_window() != hwnd_target:

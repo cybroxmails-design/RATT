@@ -74,11 +74,10 @@ except Exception:
 
 
 def dpapi_encrypt(data: bytes, entropy: Optional[bytes] = None) -> bytes:
-    """Encrypt bytes using Windows DPAPI (tied to current user login)."""
+    """Encrypt bytes using Windows DPAPI (or AES-256-GCM via AppConfig on POSIX; never static XOR)."""
     if not _HAS_DPAPI:
-        # Fallback XOR key for non-Windows test environments
-        key = hashlib.sha256(b"RATT_VAULT_FALLBACK_KEY").digest()
-        return bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+        from ratt.config import AppConfig
+        return AppConfig._dpapi_protect(data)
 
     in_blob = DATA_BLOB(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)), ctypes.POINTER(ctypes.c_byte)))
     out_blob = DATA_BLOB()
@@ -107,10 +106,10 @@ def dpapi_encrypt(data: bytes, entropy: Optional[bytes] = None) -> bytes:
 
 
 def dpapi_decrypt(cipher: bytes, entropy: Optional[bytes] = None) -> bytes:
-    """Decrypt bytes using Windows DPAPI."""
+    """Decrypt bytes using Windows DPAPI (or AES-256-GCM via AppConfig on POSIX)."""
     if not _HAS_DPAPI:
-        key = hashlib.sha256(b"RATT_VAULT_FALLBACK_KEY").digest()
-        return bytes(b ^ key[i % len(key)] for i, b in enumerate(cipher))
+        from ratt.config import AppConfig
+        return AppConfig._dpapi_unprotect(cipher) or b""
 
     in_blob = DATA_BLOB(len(cipher), ctypes.cast(ctypes.create_string_buffer(cipher, len(cipher)), ctypes.POINTER(ctypes.c_byte)))
     out_blob = DATA_BLOB()

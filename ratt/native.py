@@ -47,7 +47,16 @@ def launch_command():
     RATT is not running yet."""
     if getattr(sys, "frozen", False):
         return sys.executable, ""
-    return "wscript.exe", f'"{os.path.join(app_dir(), "RATT.vbs")}"'
+    native_exe = os.path.join(data_dir(), "native", "RATT.exe")
+    dist_exe = os.path.join(app_dir(), "dist", "RATT.exe")
+    if os.path.exists(dist_exe):
+        try:
+            os.makedirs(os.path.dirname(native_exe), exist_ok=True)
+            if not os.path.exists(native_exe):
+                shutil.copyfile(dist_exe, native_exe)
+        except OSError:
+            pass
+    return native_exe, ""
 
 
 def _file_sha256(path):

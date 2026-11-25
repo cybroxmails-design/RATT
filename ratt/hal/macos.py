@@ -109,23 +109,34 @@ class MacOSPlatform(BasePlatform):
             return False
 
     def _osascript_read_file_urls(self) -> List[str]:
-        """Query NSPasteboard for `public.file-url` file references via JXA/Foundation."""
+        """Query NSPasteboard for `NSFilenamesPboardType` and `public.file-url` file references."""
         script = (
-            'ObjC.import("AppKit");'
-            "var pb = $.NSPasteboard.generalPasteboard;"
-            "var urls = pb.readObjectsForClassesOptions($([$.NSURL.class]), $({}));"
-            "var out = [];"
-            "if (urls) {"
-            "  for (var i = 0; i < urls.count; i++) {"
-            "    var u = urls.objectAtIndex(i);"
-            "    if (u.isFileURL) out.push(ObjC.unwrap(u.path));"
-            "  }"
-            "}"
-            "JSON.stringify(out);"
+            'ObjC.import("AppKit");\n'
+            'var pb = $.NSPasteboard.generalPasteboard;\n'
+            'var out = [];\n'
+            'var fnList = pb.propertyListForType($("NSFilenamesPboardType"));\n'
+            'if (fnList && fnList.count) {\n'
+            '  for (var i = 0; i < fnList.count; i++) {\n'
+            '    out.push(ObjC.unwrap(fnList.objectAtIndex(i)));\n'
+            '  }\n'
+            '} else {\n'
+            '  var items = pb.pasteboardItems;\n'
+            '  if (items) {\n'
+            '    for (var j = 0; j < items.count; j++) {\n'
+            '      var s = items.objectAtIndex(j).stringForType($("public.file-url"));\n'
+            '      if (s && s.length) {\n'
+            '        var u = $.NSURL.URLWithString(s);\n'
+            '        if (u && u.isFileURL) out.push(ObjC.unwrap(u.path));\n'
+            '      }\n'
+            '    }\n'
+            '  }\n'
+            '}\n'
+            'JSON.stringify(out);\n'
         )
         try:
             res = subprocess.run(
-                ["osascript", "-l", "JavaScript", "-e", script],
+                ["osascript", "-l", "JavaScript", "-"],
+                input=script,
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -137,23 +148,71 @@ class MacOSPlatform(BasePlatform):
             pass
         return []
 
-    def _osascript_write_file_urls(self, files: List[str]) -> bool:
-        """Write `NSPasteboardTypeFileURL` objects to `NSPasteboard.generalPasteboard`."""
-        paths_json = json.dumps(files)
+    def get_finder_selection_and_folder(self) -> Tuple[Optional[str], List[str]]:
+        """Query macOS Finder for its current target folder and selected file paths if Finder is frontmost."""
         script = (
-            'ObjC.import("AppKit");'
-            f"var paths = {paths_json};"
-            "var pb = $.NSPasteboard.generalPasteboard;"
-            "pb.clearContents;"
-            "var arr = $.NSMutableArray.alloc.init;"
-            "for (var i = 0; i < paths.length; i++) {"
-            "  arr.addObject($.NSURL.fileURLWithPath($(paths[i])));"
-            "}"
-            "pb.writeObjects(arr);"
+            'ObjC.import("AppKit");\n'
+            'var ws = $.NSWorkspace.sharedWorkspace;\n'
+            'var front = ws.frontmostApplication;\n'
+            'var bid = front ? ObjC.unwrap(front.bundleIdentifier) : "";\n'
+            'var res = {folder: "", files: []};\n'
+            'if (bid === "com.apple.finder") {\n'
+            '  var finder = Application("Finder");\n'
+            '  try {\n'
+            '    var loc = finder.insertionLocation();\n'
+            '    if (loc) {\n'
+            '      var u = $.NSURL.URLWithString($(loc.url()));\n'
+            '      if (u && u.isFileURL) res.folder = ObjC.unwrap(u.path);\n'
+            '    }\n'
+            '  } catch (e) {}\n'
+            '  try {\n'
+            '    var sel = finder.selection();\n'
+            '    if (sel && sel.length) {\n'
+            '      for (var i = 0; i < sel.length; i++) {\n'
+            '        var su = $.NSURL.URLWithString($(sel[i].url()));\n'
+            '        if (su && su.isFileURL) res.files.push(ObjC.unwrap(su.path));\n'
+            '      }\n'
+            '    }\n'
+            '  } catch (e) {}\n'
+            '}\n'
+            'JSON.stringify(res);\n'
         )
         try:
             res = subprocess.run(
-                ["osascript", "-l", "JavaScript", "-e", script],
+                ["osascript", "-l", "JavaScript", "-"],
+                input=script,
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if res.returncode == 0 and res.stdout.strip().startswith("{"):
+                data = json.loads(res.stdout.strip())
+                folder = data.get("folder") or None
+                files = [str(f) for f in (data.get("files") or []) if f]
+                return folder, files
+        except Exception:
+            pass
+        return None, []
+
+    def _osascript_write_file_urls(self, files: List[str]) -> bool:
+        """Write `NSPasteboardTypeFileURL` objects to `NSPasteboard.generalPasteboard` via stdin (MAC-02)."""
+        paths_json = json.dumps(files)
+        script = (
+            'ObjC.import("AppKit");\n'
+            f"var paths = {paths_json};\n"
+            "var pb = $.NSPasteboard.generalPasteboard;\n"
+            "pb.clearContents;\n"
+            "var arr = $.NSMutableArray.alloc.init;\n"
+            "for (var i = 0; i < paths.length; i++) {\n"
+            "  arr.addObject($.NSURL.fileURLWithPath($(paths[i])));\n"
+            "}\n"
+            "pb.writeObjects(arr);\n"
+        )
+        try:
+            res = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-"],
+                input=script,
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -190,19 +249,20 @@ class MacOSPlatform(BasePlatform):
         return None
 
     def _osascript_write_png(self, png_bytes: bytes) -> bool:
-        """Write native PNG image data to NSPasteboard via JXA."""
+        """Write native PNG image data to NSPasteboard via JXA stdin (no ps aux CLI leak - MAC-02)."""
         b64 = base64.b64encode(png_bytes).decode("ascii")
         script = (
-            'ObjC.import("AppKit");'
-            f'var b64 = "{b64}";'
-            'var d = $.NSData.alloc.initWithBase64Encoding($(b64));'
-            'var pb = $.NSPasteboard.generalPasteboard;'
-            'pb.clearContents;'
-            'pb.setDataForType(d, "public.png");'
+            'ObjC.import("AppKit");\n'
+            f'var b64 = "{b64}";\n'
+            'var d = $.NSData.alloc.initWithBase64Encoding($(b64));\n'
+            'var pb = $.NSPasteboard.generalPasteboard;\n'
+            'pb.clearContents;\n'
+            'pb.setDataForType(d, "public.png");\n'
         )
         try:
             res = subprocess.run(
-                ["osascript", "-l", "JavaScript", "-e", script],
+                ["osascript", "-l", "JavaScript", "-"],
+                input=script,
                 capture_output=True,
                 text=True,
                 timeout=3,

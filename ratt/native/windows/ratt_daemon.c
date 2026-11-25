@@ -340,7 +340,12 @@ static int valid_token(const char *t)
 
 static int valid_action(const char *a)
 {
-    static const char *ok[] = { "open", "copy", "cut", "paste", "translate", "share", "mirror", "popup" };
+    /* WIN-05: Canonical allowlist synchronized with ratt_menu.c */
+    static const char *ok[] = {
+        "open", "copy", "cut", "paste", "translate", "share", "mirror", "popup",
+        "android", "android-copy", "android-cut", "android-paste",
+        "ios", "ios-copy", "ios-cut", "ios-paste"
+    };
     for (size_t i = 0; i < sizeof(ok) / sizeof(ok[0]); i++)
         if (strcmp(a, ok[i]) == 0) return 1;
     return 0;
@@ -353,6 +358,7 @@ static void set_filled(const char *list)
     memset(g_cfg.filled, 0, MAX_SLOT_LIMIT + 1);
     g_cfg.filled_count = 0;
     char *copy = _strdup(list), *save = NULL;
+    if (!copy) return; /* WIN-05: guard against NULL allocation */
     for (char *t = strtok_s(copy, ",", &save); t; t = strtok_s(NULL, ",", &save)) {
         int n = atoi(t);
         if (n >= 1 && n <= MAX_SLOT_LIMIT && !g_cfg.filled[n]) { g_cfg.filled[n] = 1; g_cfg.filled_count++; }
@@ -413,7 +419,7 @@ static void handle_command(char *text, int from_parent)
 
 /* ---------- window ---------- */
 
-/* SEC-R002-04: Verify whether sender_pid is Windows Explorer or a secondary RATT launch */
+/* WIN-03: Verify canonical full image path (Windows\explorer.exe or parent RATT dir), not basename only */
 static int is_authorized_explorer(DWORD sender_pid)
 {
     if (sender_pid == 0) return 0;
@@ -424,13 +430,31 @@ static int is_authorized_explorer(DWORD sender_pid)
     BOOL ok = QueryFullProcessImageNameW(hProc, 0, exe_path, &sz);
     CloseHandle(hProc);
     if (!ok || sz == 0) return 0;
-    const wchar_t *base = wcsrchr(exe_path, L'\\');
-    base = base ? (base + 1) : exe_path;
-    if (_wcsicmp(base, L"explorer.exe") == 0 ||
-        _wcsicmp(base, L"RATT.exe") == 0 ||
-        _wcsicmp(base, L"python.exe") == 0 ||
-        _wcsicmp(base, L"pythonw.exe") == 0) {
-        return 1;
+
+    /* 1. Exact canonical match against %SystemRoot%\explorer.exe */
+    wchar_t win_dir[MAX_PATH];
+    UINT wlen = GetWindowsDirectoryW(win_dir, MAX_PATH);
+    if (wlen > 0 && wlen < MAX_PATH) {
+        wchar_t expected_explorer[MAX_PATH * 2];
+        _snwprintf(expected_explorer, MAX_PATH * 2, L"%ls\\explorer.exe", win_dir);
+        expected_explorer[MAX_PATH * 2 - 1] = 0;
+        if (_wcsicmp(exe_path, expected_explorer) == 0) {
+            return 1;
+        }
+    }
+
+    /* 2. Exact match against parent process image path (secondary RATT launch) */
+    if (g_parent_pid != 0) {
+        HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, g_parent_pid);
+        if (hParent) {
+            wchar_t parent_path[MAX_PATH * 2];
+            DWORD psz = MAX_PATH * 2;
+            BOOL pok = QueryFullProcessImageNameW(hParent, 0, parent_path, &psz);
+            CloseHandle(hParent);
+            if (pok && psz > 0 && _wcsicmp(exe_path, parent_path) == 0) {
+                return 1;
+            }
+        }
     }
     return 0;
 }
@@ -619,8 +643,13 @@ __declspec(dllexport) void CALLBACK RunDaemonW(HWND w, HINSTANCE i, LPWSTR cmd, 
         return;
     }
 
+#ifdef RATT_DEBUG
     wchar_t dry[8];
     g_dry_run = GetEnvironmentVariableW(L"RATT_DAEMON_DRYRUN", dry, 8) > 0;
+#else
+    /* WIN-03: Never allow environment variable to disable auth checks in production builds */
+    g_dry_run = 0;
+#endif
 
     WNDCLASSW wc;
     memset(&wc, 0, sizeof(wc));

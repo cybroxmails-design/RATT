@@ -10,39 +10,51 @@ Ctrl+V sent to the document in front, and the receiving end of the right-click m
 The full protocol is documented at the top of daemon\\ratt_daemon.c.
 """
 import ctypes
+import json
 import os
+import socket
 import subprocess
+import sys
 import threading
 import time
 from ctypes import wintypes
+from typing import List, Optional, Tuple
 
-from ratt import native
+from ratt import hal, native
 from ratt.config import config
 
 COPYDATA_MAGIC = 0x52415454            # "RATT"
 WINDOW_CLASS = "RATTDaemonWnd"
 RETRY_SECONDS = 60                     # how often to retry while Windows refuses the helper
 
-_user32 = ctypes.WinDLL("user32", use_last_error=True)
-_user32.FindWindowExW.restype = wintypes.HWND
-_user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
-_user32.CreateWindowExW.restype = wintypes.HWND
-_user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
-                                    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                    wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
-_user32.SendMessageTimeoutW.restype = wintypes.LPARAM
-_user32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
-                                        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+_IS_WIN = os.name == "nt"
+_IS_MAC = sys.platform == "darwin"
+
+if _IS_WIN:
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _user32.FindWindowExW.restype = wintypes.HWND
+    _user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR]
+    _user32.CreateWindowExW.restype = wintypes.HWND
+    _user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+                                        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+    _user32.SendMessageTimeoutW.restype = wintypes.LPARAM
+    _user32.SendMessageTimeoutW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                                            wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t)]
+else:
+    _user32 = None
 
 _client_hwnd = None
 
 
 def _get_client_hwnd():
-    """Return a message-only HWND owned by this process so the daemon can verify our PID."""
+    """Return a hidden HWND owned by this process so the daemon can verify our PID."""
     global _client_hwnd
+    if not _IS_WIN or not _user32:
+        return 0
     if not _client_hwnd:
         _client_hwnd = _user32.CreateWindowExW(
-            0, "STATIC", "RATTClient", 0, 0, 0, 0, 0, ctypes.c_void_p(-3), None, None, None
+            0, "STATIC", "RATTClient", 0, 0, 0, 0, 0, None, None, None, None
         )
     return _client_hwnd or 0
 
@@ -52,11 +64,15 @@ class _CopyData(ctypes.Structure):
 
 
 def _helper_window():
+    if not _IS_WIN or not _user32:
+        return 0
     return _user32.FindWindowExW(ctypes.c_void_p(-3), None, WINDOW_CLASS, None)   # HWND_MESSAGE
 
 
 def send_command(text):
     """Deliver a command to the running helper. False if it is not running."""
+    if not _IS_WIN or not _user32:
+        return False
     window = _helper_window()
     if not window:
         return False
@@ -93,8 +109,18 @@ class _Input(ctypes.Structure):
 
 
 def send_keys_directly(combo):
-    """Fallback when the helper is not running: send e.g. 'ctrl+v' with SendInput."""
-    keys = [_VK[k] for k in combo.split("+")]
+    """Fallback when the helper is not running: send e.g. 'ctrl+v' with SendInput or macOS Quartz."""
+    if _IS_MAC:
+        try:
+            hal.get_platform().inject_keystrokes(combo)
+        except Exception:
+            pass
+        return
+    if not _IS_WIN:
+        return
+    keys = [_VK[k] for k in combo.split("+") if k in _VK]
+    if not keys:
+        return
     KEYEVENTF_KEYUP = 2
     events = [(vk, 0) for vk in keys] + [(vk, KEYEVENTF_KEYUP) for vk in reversed(keys)]
     inputs = (_Input * len(events))()
@@ -254,24 +280,52 @@ class DaemonLink:
     def __init__(self, app):
         self.app = app
         self._process = None
+        self._lib = None
+        self._inproc_thread = None
+        self._c_callback = None
         self._state_sent = None
         self._next_start = 0.0
         self._told_user = False
         self._fallback = FallbackHotkeyEngine(app)
+        self._mac_finder_started = False
+        if _IS_MAC:
+            self._start_mac_finder_ipc()
 
     # -- lifecycle --
 
+    def _is_native_active(self) -> bool:
+        if _IS_WIN:
+            if self._inproc_thread and self._inproc_thread.is_alive() and _helper_window():
+                return True
+            if self._process is not None and self._process.poll() is None and _helper_window():
+                return True
+        return False
+
     def tick(self):
-        if self._process is None or self._process.poll() is not None:
+        if self._is_native_active():
+            if self._fallback and self._fallback._running:
+                self._fallback.stop()
+            self._sync_state()
+            return
+
+        if time.time() >= self._next_start:
+            self._start()
+
+        if not self._is_native_active():
             if self._fallback and not self._fallback._running and config.enabled:
                 self._fallback.start()
-            if time.time() >= self._next_start:
-                self._start()
         else:
+            if self._fallback and self._fallback._running:
+                self._fallback.stop()
             self._sync_state()
 
     def _start(self):
         self._next_start = time.time() + RETRY_SECONDS
+        if _IS_MAC:
+            self._start_mac_finder_ipc()
+            return
+        if not _IS_WIN:
+            return
         try:
             dll = native.install("ratt_daemon.dll")
         except OSError as error:
@@ -282,6 +336,51 @@ class DaemonLink:
             native.log("daemon", "Windows refused to load the helper (Application Control) - activating fallback engine")
             self._fallback.start()
             return
+
+        # Primary mode: load ratt_daemon.dll in-process on a dedicated thread via ctypes.
+        # Avoids Windows 11 Smart App Control blocking rundll32.exe on unsigned DLLs in %APPDATA%.
+        try:
+            lib = ctypes.WinDLL(dll)
+            if hasattr(lib, "SetEventCallback") and hasattr(lib, "RunDaemonW"):
+                CB_TYPE = ctypes.WINFUNCTYPE(None, ctypes.c_char_p)
+
+                def _on_c_event(raw_line):
+                    if raw_line:
+                        try:
+                            self._handle_event(raw_line.decode("utf-8", "replace").strip())
+                        except Exception:
+                            pass
+
+                self._c_callback = CB_TYPE(_on_c_event)
+                lib.SetEventCallback.argtypes = [CB_TYPE]
+                lib.SetEventCallback.restype = None
+                lib.SetEventCallback(self._c_callback)
+
+                fn = lib.RunDaemonW
+                fn.argtypes = [wintypes.HWND, wintypes.HINSTANCE, wintypes.LPWSTR, ctypes.c_int]
+                fn.restype = None
+                self._lib = lib
+                self._state_sent = None
+                self._inproc_thread = threading.Thread(
+                    target=fn,
+                    args=(None, None, f"--parent {os.getpid()}", 0),
+                    daemon=True,
+                    name="RATTDaemonInProc",
+                )
+                self._inproc_thread.start()
+                for _ in range(15):
+                    if _helper_window():
+                        break
+                    time.sleep(0.02)
+                if _helper_window():
+                    if self._fallback and self._fallback._running:
+                        self._fallback.stop()
+                    self._sync_state()
+                    native.log("daemon", "In-process native hotkey & shell daemon active")
+                    return
+        except Exception as e:
+            native.log("daemon", f"In-process daemon load failed ({e}), trying rundll32 fallback")
+
         try:
             self._process = subprocess.Popen(
                 ["rundll32.exe", f"{dll},RunDaemonW", "--parent", str(os.getpid())],
@@ -291,6 +390,93 @@ class DaemonLink:
         except Exception as e:
             native.log("daemon", f"rundll32 spawn failed: {e} - activating fallback engine")
             self._fallback.start()
+
+    def _start_mac_finder_ipc(self):
+        """Listen on ~/Library/Application Support/RATT/finder_ipc.sock for macOS FinderSync file Copy/Cut/Paste."""
+        if not _IS_MAC or self._mac_finder_started:
+            return
+        self._mac_finder_started = True
+
+        def _server():
+            sock_dir = os.path.expanduser("~/Library/Application Support/RATT")
+            os.makedirs(sock_dir, mode=0o700, exist_ok=True)
+            sock_path = os.path.join(sock_dir, "finder_ipc.sock")
+            try:
+                if os.path.exists(sock_path):
+                    os.unlink(sock_path)
+            except Exception:
+                pass
+            srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                srv.bind(sock_path)
+                os.chmod(sock_path, 0o600)
+                srv.listen(8)
+                while True:
+                    conn, _ = srv.accept()
+                    with conn:
+                        raw = conn.recv(65536).decode("utf-8", "replace").strip()
+                        if not raw:
+                            continue
+                        for line in raw.splitlines():
+                            try:
+                                msg = json.loads(line)
+                                act = str(msg.get("action", "")).lower()
+                                slot = int(msg.get("slot", 1))
+                                files = msg.get("files") or []
+                                folder = msg.get("folder") or ""
+                                if act in ("copy", "cut") and files:
+                                    self.app.queue_action(act, [str(slot)] + [str(f) for f in files])
+                                elif act == "paste" and folder:
+                                    self.app.queue_action("paste", [str(slot), str(folder)])
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+            finally:
+                try:
+                    srv.close()
+                except Exception:
+                    pass
+
+        threading.Thread(target=_server, daemon=True, name="RATTMacFinderIPC").start()
+
+    def query_explorer_context(self, target_hwnd: Optional[int] = None) -> Tuple[Optional[str], List[str]]:
+        """Query the active Windows File Explorer (or macOS Finder) window for its current folder and selected files."""
+        if _IS_MAC:
+            plat = hal.get_platform()
+            if hasattr(plat, "get_finder_selection_and_folder"):
+                return plat.get_finder_selection_and_folder()
+            return None, []
+        if not _IS_WIN:
+            return None, []
+        try:
+            lib = self._lib
+            if lib is None:
+                dll = native.install("ratt_daemon.dll")
+                if native.can_load(dll):
+                    lib = ctypes.WinDLL(dll)
+                    self._lib = lib
+            if lib and hasattr(lib, "GetExplorerSelectionW"):
+                fn = lib.GetExplorerSelectionW
+                fn.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+                fn.restype = ctypes.c_int
+                buf = ctypes.create_unicode_buffer(16384)
+                hwnd_arg = wintypes.HWND(target_hwnd) if target_hwnd else None
+                if fn(hwnd_arg, buf, 16384):
+                    folder: Optional[str] = None
+                    files: List[str] = []
+                    for line in buf.value.splitlines():
+                        line = line.strip()
+                        if line.startswith("FOLDER\t"):
+                            folder = line.split("\t", 1)[1].strip()
+                        elif line.startswith("FILE\t"):
+                            fp = line.split("\t", 1)[1].strip()
+                            if fp:
+                                files.append(fp)
+                    return folder, files
+        except Exception:
+            pass
+        return None, []
 
     # -- app -> helper --
 
@@ -311,7 +497,7 @@ class DaemonLink:
         self._state_sent = None
         self._sync_state()
         if hasattr(self, "_fallback") and self._fallback:
-            if config.enabled:
+            if config.enabled and not self._is_native_active():
                 self._fallback.start()
             else:
                 self._fallback.stop()

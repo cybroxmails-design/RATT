@@ -39,9 +39,12 @@ class RattAccessibilityService : AccessibilityService() {
     }
 
     fun injectText(text: String) {
+        val clean = SlotRepository.sanitizeIncomingText(text) ?: return
         val root = rootInActiveWindow ?: return
         val focused = root.findFocus(AccessibilityNodeInfo.FOCUS_INPUT) ?: return
-        val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text) }
+        // AND-04: Do not silently inject clipboard content into password fields
+        if (focused.isPassword) return
+        val args = Bundle().apply { putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, clean) }
         focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 

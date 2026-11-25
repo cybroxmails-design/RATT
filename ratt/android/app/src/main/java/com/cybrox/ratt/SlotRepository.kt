@@ -144,20 +144,103 @@ object SlotRepository {
         }
     }
 
+    private var activePairingPin: String? = null
+    private var activePairingPinExpiresMs: Long = 0L
+    private var pairingPinFailures: Int = 0
+
+    /**
+     * Save the shared 256-bit PC <-> Android sync token received during authenticated PIN pairing.
+     */
+    fun setSyncToken(context: Context, token: String) {
+        val clean = token.trim()
+        if (clean.length < 16) return
+        context.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
+            .edit()
+            .putString("ratt_sync_token", clean)
+            .commit()
+    }
+
+    /**
+     * Generate a single-use 6-digit pairing PIN valid for 5 minutes.
+     */
+    fun generatePairingPin(): String {
+        val code = java.security.SecureRandom().nextInt(1_000_000)
+        val pin = String.format("%06d", code)
+        activePairingPin = pin
+        activePairingPinExpiresMs = System.currentTimeMillis() + 300_000L
+        pairingPinFailures = 0
+        return pin
+    }
+
+    /**
+     * Verify and consume the active 6-digit pairing PIN in constant time (5-attempt lockout).
+     */
+    fun verifyAndConsumePairingPin(candidate: String?): Boolean {
+        val expected = activePairingPin ?: return false
+        if (System.currentTimeMillis() > activePairingPinExpiresMs || pairingPinFailures >= 5) {
+            activePairingPin = null
+            return false
+        }
+        val clean = candidate?.trim() ?: ""
+        val ok = java.security.MessageDigest.isEqual(
+            clean.toByteArray(Charsets.UTF_8),
+            expected.toByteArray(Charsets.UTF_8)
+        )
+        if (ok) {
+            activePairingPin = null
+            pairingPinFailures = 0
+            return true
+        }
+        pairingPinFailures++
+        return false
+    }
+
+    /**
+     * Return or generate a per-installation 256-bit sync authentication token (AND-01).
+     */
+    fun getOrCreateSyncToken(context: Context): String {
+        val prefs = context.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
+        val existing = prefs.getString("ratt_sync_token", null)
+        if (!existing.isNullOrEmpty()) return existing
+        val bytes = ByteArray(32)
+        java.security.SecureRandom().nextBytes(bytes)
+        val token = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE)
+        Arrays.fill(bytes, 0.toByte())
+        prefs.edit().putString("ratt_sync_token", token).apply()
+        return token
+    }
+
+    /**
+     * Sanitize incoming text against BiDi/RTLO spoofing, NUL bytes, and blocked URI schemes.
+     */
+    fun sanitizeIncomingText(raw: String): String? {
+        if (raw.isEmpty()) return null
+        val cleaned = raw.replace(Regex("[\\u200B-\\u200F\\u202A-\\u202E\\u2060-\\u2069\\uFEFF\\u0000]"), "")
+        val lower = cleaned.trim().lowercase()
+        val blocked = listOf("javascript:", "vbscript:", "data:", "file://", "intent:", "ms-msdt:", "powershell:")
+        for (scheme in blocked) {
+            if (lower.startsWith(scheme) || lower.contains(" $scheme")) {
+                return null
+            }
+        }
+        return cleaned
+    }
+
     /**
      * Store a slot payload encrypted with the hardware-backed Android Keystore AES-256-GCM key.
+     * AND-03: Never keeps plaintext copies in rawRamMirrors or MainActivity.liveSlots.
      */
     fun put(slotId: Int, plainText: String) {
         if (slotId !in 1..10) return
+        val sanitized = sanitizeIncomingText(plainText) ?: return
         val ctx = appContext
-        if (ctx != null && !UserTierManager.isAllowedPayloadForTier(ctx, plainText)) {
+        if (ctx != null && !UserTierManager.isAllowedPayloadForTier(ctx, sanitized)) {
             return
         }
         clear(slotId) // Sanitize any previous buffer first
         clearedSlots.remove(slotId)
 
-        val rawBytes = plainText.toByteArray(Charsets.UTF_8)
-        rawRamMirrors[slotId] = rawBytes.copyOf()
+        val rawBytes = sanitized.toByteArray(Charsets.UTF_8)
 
         try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -167,16 +250,16 @@ object SlotRepository {
             encryptedBuffers[slotId] = Pair(iv, cipherText)
 
             var preview = ""
-            if (plainText.startsWith("{")) {
+            if (sanitized.startsWith("{")) {
                 try {
-                    val obj = JSONObject(plainText)
+                    val obj = JSONObject(sanitized)
                     if (obj.has("preview")) {
                         preview = obj.getString("preview")
                     }
                 } catch (_: Exception) {}
             }
             if (preview.isEmpty()) {
-                val singleLine = plainText.replace("\n", " ").trim()
+                val singleLine = sanitized.replace("\n", " ").trim()
                 if (singleLine.contains(".") && singleLine.length > 28) {
                     val extPart = singleLine.substringAfterLast(".")
                     if (extPart.length in 1..5 && !extPart.contains(" ")) {
@@ -196,7 +279,6 @@ object SlotRepository {
             // Zero temporary stack array (MEM-003)
             Arrays.fill(rawBytes, 0.toByte())
         }
-        MainActivity.liveSlots[slotId] = plainText
         notifyListeners()
     }
 
@@ -204,7 +286,7 @@ object SlotRepository {
      * Decrypt a slot's payload from hardware-backed Android Keystore storage on demand.
      */
     fun decryptSlotBytes(slotId: Int): String {
-        val pair = encryptedBuffers[slotId] ?: return MainActivity.liveSlots[slotId].orEmpty()
+        val pair = encryptedBuffers[slotId] ?: return ""
         return try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             val spec = GCMParameterSpec(GCM_TAG_LENGTH_BITS, pair.first)
@@ -216,15 +298,11 @@ object SlotRepository {
                 Arrays.fill(plainBytes, 0.toByte())
             }
         } catch (_: Exception) {
-            MainActivity.liveSlots[slotId].orEmpty()
+            ""
         }
     }
 
     fun getSlotContent(slotId: Int): String {
-        val mem = MainActivity.liveSlots[slotId]
-        if (!mem.isNullOrEmpty()) return mem
-        val ram = rawRamMirrors[slotId]
-        if (ram != null && ram.isNotEmpty()) return String(ram, Charsets.UTF_8)
         val decrypted = decryptSlotBytes(slotId)
         if (decrypted.isNotEmpty()) return decrypted
         return liveSlots[slotId]?.preview.orEmpty()
@@ -338,10 +416,7 @@ object SlotRepository {
                 return null
             }
 
-            val incomingTier = payload.optString("tier", "")
-            if (incomingTier.isNotEmpty()) {
-                appContext?.let { UserTierManager.setTier(it, incomingTier) }
-            }
+            // AND-01: Never allow remote LAN peers to mutate subscription tier!
 
             when (payload.optString("action")) {
                 "CLEAR_SLOT" -> {

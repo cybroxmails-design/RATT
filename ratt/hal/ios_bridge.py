@@ -610,16 +610,42 @@ class IOSBridgePlatform(BasePlatform):
 
         if kind == "files" and data_b64:
             try:
+                fname = os.path.basename(str(request.get("file_name") or ""))
+                # WIN-01: Validate filename, BiDi/nulls, reserved names, and blocked extensions BEFORE writing to disk
+                if (
+                    not fname
+                    or security_guard.contains_bidi_spoofing(fname)
+                    or "\x00" in fname
+                    or ":" in fname
+                    or fname.rstrip(". ").split(".")[0].upper() in security_guard._RESERVED_DEVICES
+                ):
+                    return self._reply(False, error="Security Block: Unsafe file name.")
+                parts = fname.rstrip(". ").lower().split(".")
+                if len(parts) > 1 and any(("." + p) in security_guard.BLOCKED_EXTENSIONS for p in parts[1:]):
+                    return self._reply(False, error="Security Block: Blocked executable or script file extension.")
                 file_bytes = base64.b64decode(data_b64.encode("ascii"))
-                fname = request.get("file_name", "inbound_file.bin")
-                fname = os.path.basename(fname)
+                if len(file_bytes) > 25 * 1024 * 1024:
+                    return self._reply(False, error="File exceeds 25 MB mobile sync limit.")
                 base_dir = os.path.join(os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or os.path.expanduser("~"), "RATT", "spool")
                 os.makedirs(base_dir, exist_ok=True)
                 dest = os.path.join(base_dir, f"ios_{secrets.token_hex(4)}_{fname}")
                 with open(dest, "wb") as f:
                     f.write(file_bytes)
-                if hasattr(self, "_clipboard_manager") and self._clipboard_manager:
-                    self._clipboard_manager.store_files_to_slot(slot, [dest])
+                stored_ok = False
+                try:
+                    if hasattr(self, "_clipboard_manager") and self._clipboard_manager:
+                        res = self._clipboard_manager.store_files_to_slot(slot, [dest])
+                        stored_ok = bool(res[0] if isinstance(res, tuple) else res)
+                    else:
+                        stored_ok = True
+                finally:
+                    if not stored_ok and os.path.exists(dest):
+                        try:
+                            os.remove(dest)
+                        except OSError:
+                            pass
+                if not stored_ok:
+                    return self._reply(False, error="File rejected by security policy.")
                 with self._lock:
                     self._inbox[slot] = f"[File: {fname}]"
                 if self.on_inbound:
@@ -767,18 +793,19 @@ class IOSBridgePlatform(BasePlatform):
         return True
 
     def protect_memory_buffer(self, data: bytes) -> bytes:
+        """Encrypt bytes in RAM using a per-process ephemeral 256-bit random key (COM-01)."""
         if not data:
             return b""
+        if not hasattr(self, "_ram_key") or not self._ram_key:
+            self._ram_key = secrets.token_bytes(32)
         nonce = secrets.token_bytes(12)
-        key = hashlib.sha256(_HKDF_SALT + _HKDF_INFO).digest()
-        return nonce + AESGCM(key).encrypt(nonce, data, b"RATT-IOS-RAM-V2")
+        return nonce + AESGCM(self._ram_key).encrypt(nonce, data, b"RATT-IOS-RAM-V2")
 
     def unprotect_memory_buffer(self, data: bytes, orig_len: int = 0) -> bytes:
-        if not data or len(data) < 28:
+        if not data or len(data) < 28 or not hasattr(self, "_ram_key") or not self._ram_key:
             return b""
         try:
-            key = hashlib.sha256(_HKDF_SALT + _HKDF_INFO).digest()
-            dec = AESGCM(key).decrypt(data[:12], data[12:], b"RATT-IOS-RAM-V2")
+            dec = AESGCM(self._ram_key).decrypt(data[:12], data[12:], b"RATT-IOS-RAM-V2")
             return dec[:orig_len] if orig_len > 0 else dec
         except Exception:
             return b""

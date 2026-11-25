@@ -157,12 +157,24 @@ class TranslationManager:
 
     # ---- backends ----
 
+    @staticmethod
+    def _validate_lang_code(code: str, allow_auto: bool = False) -> str:
+        c = (code or "").strip().lower()
+        if allow_auto and c == "auto":
+            return "auto"
+        valid_codes = {lc for lc, _ in SUPPORTED_LANGUAGES}
+        if c not in valid_codes:
+            raise TranslationError(f"Unsupported language code: {code!r}")
+        return c
+
     def _web(self, chunk, target, source):
         import json
         import urllib.parse
         import urllib.request
-        tl = _GTX_CODES.get(target, target)
-        sl = "auto" if source == "auto" else _GTX_CODES.get(source, source)
+        clean_target = self._validate_lang_code(target, allow_auto=False)
+        clean_source = self._validate_lang_code(source, allow_auto=True)
+        tl = urllib.parse.quote(_GTX_CODES.get(clean_target, clean_target), safe="")
+        sl = "auto" if clean_source == "auto" else urllib.parse.quote(_GTX_CODES.get(clean_source, clean_source), safe="")
         url = ("https://translate.googleapis.com/translate_a/single?client=gtx"
                f"&sl={sl}&tl={tl}&dt=t")
         req = urllib.request.Request(
@@ -177,16 +189,22 @@ class TranslationManager:
 
     def _cloud(self, chunk, target, source, key):
         import json
-        import urllib.parse
         import urllib.request
         import html
-        body = {"q": chunk, "target": _GTX_CODES.get(target, target), "format": "text"}
-        if source != "auto":
-            body["source"] = source
+        clean_target = self._validate_lang_code(target, allow_auto=False)
+        clean_source = self._validate_lang_code(source, allow_auto=True)
+        body = {"q": chunk, "target": _GTX_CODES.get(clean_target, clean_target), "format": "text"}
+        if clean_source != "auto":
+            body["source"] = _GTX_CODES.get(clean_source, clean_source)
+        # COM-08: Pass API key in HTTP header rather than URL query string
         req = urllib.request.Request(
-            "https://translation.googleapis.com/language/translate/v2?key=" + urllib.parse.quote(key),
+            "https://translation.googleapis.com/language/translate/v2",
             data=json.dumps(body).encode("utf-8"),
-            headers={"Content-Type": "application/json"})
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": key,
+            },
+        )
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))

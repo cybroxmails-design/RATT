@@ -63,6 +63,12 @@ if _IS_WIN:
     _user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
     _user32.GetForegroundWindow.argtypes = []
     _user32.GetForegroundWindow.restype = wintypes.HWND
+    _user32.CreateWindowExW.restype = wintypes.HWND
+    _user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+    ]
     _user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_ulong]
     _user32.keybd_event.restype = None
 
@@ -91,12 +97,29 @@ if _IS_WIN:
     CF_SVG = _user32.RegisterClipboardFormatW("SVG")
     CF_HTML = _user32.RegisterClipboardFormatW("HTML Format")
     CF_PREFERREDDROPEFFECT = _user32.RegisterClipboardFormatW("Preferred DropEffect")
+    CF_FILENAMEW = _user32.RegisterClipboardFormatW("FileNameW")
 else:
-    CF_PNG = CF_MIME_PNG = CF_MIME_SVG = CF_SVG = CF_HTML = CF_PREFERREDDROPEFFECT = 0
+    CF_PNG = CF_MIME_PNG = CF_MIME_SVG = CF_SVG = CF_HTML = CF_PREFERREDDROPEFFECT = CF_FILENAMEW = 0
 
 # Fallback HGLOBAL table used ONLY if OS UIPI blocks SetClipboardData (e.g. Low-IL sandbox / CI)
 _sandbox_hglobals: Dict[int, int] = {}
 _sandbox_seq: int = 0
+_clip_owner_hwnd = None
+
+
+def _get_clip_owner_hwnd():
+    """Return a valid hidden HWND owned by the current thread/process for OpenClipboard."""
+    global _clip_owner_hwnd
+    if not _IS_WIN:
+        return None
+    if not _clip_owner_hwnd:
+        try:
+            _clip_owner_hwnd = _user32.CreateWindowExW(
+                0, "STATIC", "RATTClipboardOwner", 0, 0, 0, 0, 0, None, None, None, None
+            )
+        except Exception:
+            _clip_owner_hwnd = None
+    return _clip_owner_hwnd
 
 
 def _clear_sandbox_hglobals():
@@ -119,16 +142,18 @@ def _fmt_in_sandbox(fmt: int) -> bool:
 def _has_format(fmt: int) -> bool:
     if not fmt:
         return False
-    if _fmt_in_sandbox(fmt):
+    if _IS_WIN and _user32.IsClipboardFormatAvailable(fmt):
         return True
-    return bool(_IS_WIN and _user32.IsClipboardFormatAvailable(fmt))
+    return _fmt_in_sandbox(fmt)
 
 
 def _get_format_handle(fmt: int) -> int:
+    if _IS_WIN and _user32.IsClipboardFormatAvailable(fmt):
+        h = _user32.GetClipboardData(fmt)
+        if h:
+            return h
     if _fmt_in_sandbox(fmt):
         return _sandbox_hglobals[fmt]
-    if _IS_WIN and _user32.IsClipboardFormatAvailable(fmt):
-        return _user32.GetClipboardData(fmt) or 0
     return 0
 
 
@@ -149,8 +174,9 @@ class _ClipboardLock:
     def __enter__(self) -> bool:
         if not _IS_WIN:
             return False
+        owner = _get_clip_owner_hwnd()
         for _ in range(self.retries):
-            if _user32.OpenClipboard(None):
+            if (owner and _user32.OpenClipboard(owner)) or _user32.OpenClipboard(None):
                 self.opened = True
                 return True
             time.sleep(self.delay)
@@ -456,6 +482,9 @@ def write_clipboard_bundle(bundle: dict) -> Tuple[bool, str]:
             ok_h = _write_raw_format(CF_HDROP, hdrop_bytes)
             if CF_PREFERREDDROPEFFECT:
                 _write_raw_format(CF_PREFERREDDROPEFFECT, eff_bytes)
+            if CF_FILENAMEW and safe_files:
+                fn_bytes = safe_files[0].encode("utf-16-le") + b"\x00\x00"
+                _write_raw_format(CF_FILENAMEW, fn_bytes)
             return (True, "") if ok_h else (False, "Failed to write file list to clipboard.")
 
     if kind in ("image", "diagram"):
