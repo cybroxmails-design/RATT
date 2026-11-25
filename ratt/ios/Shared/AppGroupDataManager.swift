@@ -299,12 +299,15 @@ public class AppGroupDataManager {
                     fileName: fileName,
                     mimeType: mimeType
                 )
-                // Also copy incoming synced text/image to the iPhone system clipboard on main thread
+                // Only update the iPhone system clipboard if this slot is currently selected as the user's Active Paste Slot
                 DispatchQueue.main.async {
-                    if kind == "image", let b64 = dataB64, let imgData = Data(base64Encoded: b64), let img = UIImage(data: imgData) {
-                        UIPasteboard.general.image = img
-                    } else if !content.isEmpty {
-                        UIPasteboard.general.string = content
+                    let activeSlot = UserDefaults.standard.integer(forKey: "ratt_active_paste_slot")
+                    if activeSlot == slotId {
+                        if kind == "image", let b64 = dataB64, let imgData = Data(base64Encoded: b64), let img = UIImage(data: imgData) {
+                            UIPasteboard.general.image = img
+                        } else if !content.isEmpty {
+                            UIPasteboard.general.string = content
+                        }
                     }
                     NotificationCenter.default.post(name: .slotUpdated, object: nil)
                 }

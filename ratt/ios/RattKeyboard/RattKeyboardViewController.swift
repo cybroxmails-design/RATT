@@ -38,6 +38,38 @@ class RattKeyboardViewController: UIInputViewController {
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         refreshPaletteCards()
+        pullSlotsFromLocalhostIfAvailable()
+    }
+
+    /// Fallback for Sideloadly Free Apple ID installs where App Group entitlement is stripped:
+    /// Fetches all 10 slots from the local RATT container app listener on 127.0.0.1:49211.
+    private func pullSlotsFromLocalhostIfAvailable() {
+        guard let url = URL(string: "http://127.0.0.1:49211/get_all_slots") else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "GET"
+        req.timeoutInterval = 0.8
+        req.setValue(dataManager.getOrCreateSyncToken(), forHTTPHeaderField: "X-RATT-Token")
+        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+            guard let self = self,
+                  let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let slots = json["slots"] as? [String: String] else {
+                return
+            }
+            var updated = false
+            for (k, v) in slots {
+                if let sId = Int(k), (1...10).contains(sId), !v.isEmpty {
+                    _ = self.slotStore.encryptAndStore(slot: sId, text: v)
+                    _ = self.dataManager.saveSlot(id: sId, content: v)
+                    updated = true
+                }
+            }
+            if updated {
+                DispatchQueue.main.async {
+                    self.refreshPaletteCards()
+                }
+            }
+        }.resume()
     }
 
     private let pcSlotHexColors = [

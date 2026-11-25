@@ -1,10 +1,11 @@
 // ContentView.swift — RATT v2 for iOS Container App (iPhone X through iPhone 17 Pro Max)
 // Full Feature Parity with RATT Android & PC:
 // 1. Compatible with iPhone X (iOS 15/16) and all newer iPhones up to iPhone 17 Pro Max
-// 2. Touch anywhere outside text fields to minimize keyboard + dedicated Hide Keyboard button
-// 3. Two-Way Clipboard Saving:
-//    - Save typed text or current iPhone Clipboard into any RATT Slot (1-10)
-//    - Tap any Slot Row or its "Copy" button to copy that Slot directly to the iPhone Clipboard
+// 2. Choose Any Slot (1–10) to Paste:
+//    - Dedicated "CHOOSE SLOT TO PASTE (1–10)" Picker & 10-Slot Quick-Paste Grid
+//    - Tap any slot (or its "Paste This" button) to load THAT chosen slot into the iPhone Clipboard
+//    - Active Paste Slot badge ("✓ ACTIVE") clearly shows which slot is currently ready to paste
+// 3. Touch anywhere outside text fields to minimize keyboard + dedicated Hide Keyboard button
 // 4. Direct Wi-Fi Pairing & Two-Way Sync with RATT PC (ports 49211 / 49210)
 
 import SwiftUI
@@ -52,17 +53,19 @@ public struct ContentView: View {
 
     @State private var userTier: RattUserTier = .basic
     @State private var slotPreviews: [Int: String] = [:]
+    @State private var activePasteSlot: Int = 0
+    @State private var lastSavedTexts: Set<String> = []
     @State private var directInputText: String = ""
-    @State private var statusMessage: String = "RATT v2 Ready • Tap any slot to copy to iPhone Clipboard"
+    @State private var statusMessage: String = "RATT v2 Ready • Choose any slot (1–10) below to paste"
     @State private var statusIsSuccess: Bool = true
     @State private var showUpgradeAlert: Bool = false
     @State private var upgradeReason: String = ""
     @State private var showPairDialog: Bool = false
     @State private var pairIpDraft: String = ""
-    @State private var showSlotSheet: Bool = false
+    @State private var showSaveSlotSheet: Bool = false
+    @State private var showPasteSlotSheet: Bool = false
     @State private var showCrossSyncAlert: Bool = false
     @State private var crossSyncTarget: String = ""
-    @State private var crossSyncIpInput: String = ""
     @State private var pcIpAddress: String = ""
     @State private var iphoneIpAddress: String = ""
 
@@ -133,16 +136,24 @@ public struct ContentView: View {
                             dismissKeyboard()
                         }
 
-                        // ================= LIVE STATUS BANNER =================
-                        HStack(spacing: 8) {
-                            Image(systemName: statusIsSuccess ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                                .foregroundColor(statusIsSuccess ? Color(hex: "#39FF14") : Color(hex: "#F59E0B"))
-                                .font(.system(size: 13))
-                            Text(statusMessage)
-                                .font(.system(size: 11.5, weight: .semibold))
-                                .foregroundColor(.white)
-                                .lineLimit(2)
-                            Spacer()
+                        // ================= LIVE STATUS & ACTIVE PASTE SLOT BANNER =================
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 8) {
+                                Image(systemName: statusIsSuccess ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                                    .foregroundColor(statusIsSuccess ? Color(hex: "#39FF14") : Color(hex: "#F59E0B"))
+                                    .font(.system(size: 13))
+                                Text(statusMessage)
+                                    .font(.system(size: 11.5, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .lineLimit(2)
+                                Spacer()
+                            }
+                            if activePasteSlot > 0, let activeTxt = slotPreviews[activePasteSlot], !activeTxt.isEmpty {
+                                Text("📌 Ready to Paste: Slot #\(activePasteSlot) (\"\(activeTxt)\")")
+                                    .font(.system(size: 10.5, weight: .bold))
+                                    .foregroundColor(Color(hex: "#39FF14"))
+                                    .lineLimit(1)
+                            }
                         }
                         .padding(10)
                         .background(Color(hex: "#10241B"))
@@ -156,52 +167,155 @@ public struct ContentView: View {
                             dismissKeyboard()
                         }
 
-                        // ================= 2. KEYBOARD SETUP & PERMISSION DIAGNOSTICS =================
+                        // ================= 2. CHOOSE SLOT TO PASTE (1-10) =================
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(Color(hex: "#39FF14"))
-                                        .frame(width: 8, height: 8)
-                                    Text("RATT KEYBOARD & AIR-GAP DIAGNOSTICS")
-                                        .font(.system(size: 11, weight: .bold))
-                                        .foregroundColor(Color(hex: "#39FF14"))
-                                }
+                                Text("1️⃣ CHOOSE WHICH SLOT TO PASTE (1–10)")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(Color(hex: "#39FF14"))
                                 Spacer()
-                                Button(action: {
-                                    dismissKeyboard()
-                                    if let url = URL(string: UIApplication.openSettingsURLString) {
-                                        UIApplication.shared.open(url)
-                                    }
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "gearshape.fill")
-                                        Text("Open Settings")
-                                    }
-                                    .font(.system(size: 10.5, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .padding(.horizontal, 9)
-                                    .padding(.vertical, 5)
-                                    .background(Color(hex: "#238636"))
-                                    .cornerRadius(6)
+                                if activePasteSlot > 0 {
+                                    Text("Active: Slot #\(activePasteSlot)")
+                                        .font(.system(size: 10.5, weight: .bold))
+                                        .foregroundColor(Color(hex: "#39FF14"))
                                 }
                             }
 
-                            Text("Settings → General → Keyboard → Keyboards → Add 'RATT v2' → Enable 'Allow Full Access'")
+                            // Big Slot Picker Button to Choose from Slots 1-10 for Pasting
+                            Button(action: {
+                                dismissKeyboard()
+                                showPasteSlotSheet = true
+                            }) {
+                                HStack {
+                                    Image(systemName: "doc.on.clipboard.fill")
+                                    Text(activePasteSlot > 0 ? "📤 Choose Slot to Paste (Currently Slot #\(activePasteSlot))..." : "📤 Choose Slot to Paste (Slots 1–10)...")
+                                }
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(.black)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 40)
+                                .background(Color(hex: "#39FF14"))
+                                .cornerRadius(6)
+                            }
+
+                            Text("Or tap any filled slot button below to select it as your active Paste slot:")
                                 .font(.system(size: 10))
                                 .foregroundColor(Color(hex: "#8B949E"))
+
+                            // 10 Quick "Select to Paste" Buttons
+                            VStack(spacing: 6) {
+                                HStack(spacing: 5) {
+                                    ForEach(1...5, id: \.self) { slotId in
+                                        quickPasteSlotButton(slotId: slotId)
+                                    }
+                                }
+                                HStack(spacing: 5) {
+                                    ForEach(6...10, id: \.self) { slotId in
+                                        quickPasteSlotButton(slotId: slotId)
+                                    }
+                                }
+                            }
                         }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
                         .background(Color(hex: "#161B22"))
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(hex: "#30363D"), lineWidth: 1))
-                        .cornerRadius(8)
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(hex: "#10B981"), lineWidth: 1.5))
+                        .cornerRadius(10)
                         .padding(.horizontal)
-                        .onTapGesture {
-                            dismissKeyboard()
+
+                        // ================= 3. SAVE NEW TEXT OR CLIPBOARD TO A SLOT =================
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("2️⃣ SAVE TEXT OR CLIPBOARD INTO A SLOT")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(Color(hex: "#00BFFF"))
+                                Spacer()
+                                Button("Hide Keyboard ⌨️↓") {
+                                    dismissKeyboard()
+                                }
+                                .font(.system(size: 10.5, weight: .bold))
+                                .foregroundColor(Color(hex: "#00BFFF"))
+                            }
+
+                            HStack(spacing: 6) {
+                                TextField("Type or paste new text here to save into a slot...", text: $directInputText)
+                                    .font(.system(size: 13))
+                                    .foregroundColor(.white)
+                                    .padding(10)
+                                    .background(Color(hex: "#0D1117"))
+                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(hex: "#30363D"), lineWidth: 1))
+                                    .cornerRadius(6)
+
+                                if !directInputText.isEmpty {
+                                    Button(action: {
+                                        directInputText = ""
+                                        dismissKeyboard()
+                                    }) {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .foregroundColor(Color(hex: "#8B949E"))
+                                            .font(.system(size: 18))
+                                    }
+                                }
+                            }
+
+                            Button(action: {
+                                dismissKeyboard()
+                                showSaveSlotSheet = true
+                            }) {
+                                HStack {
+                                    Image(systemName: "square.and.arrow.down.fill")
+                                    Text(directInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                         ? "📥 Save Copied iPhone Clipboard to Slot (Choose 1–10)..."
+                                         : "📥 Save Typed Text Above to Slot (Choose 1–10)...")
+                                }
+                                .font(.system(size: 12.5, weight: .bold))
+                                .foregroundColor(.white)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 38)
+                                .background(Color(hex: "#00BFFF"))
+                                .cornerRadius(6)
+                            }
+                        }
+                        .padding(14)
+                        .background(Color(hex: "#161B22"))
+                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(hex: "#30363D"), lineWidth: 1))
+                        .cornerRadius(10)
+                        .padding(.horizontal)
+
+                        // ================= 4. LIVE 10-SLOT PREVIEW (TAP 'PASTE THIS' ON ANY SLOT) =================
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("LIVE 10-SLOT PREVIEW (TAP 'PASTE THIS' TO CHOOSE SLOT FOR PASTING)")
+                                .font(.system(size: 10, weight: .bold))
+                                .foregroundColor(Color(hex: "#8B949E"))
+                                .padding(.horizontal)
+
+                            VStack(spacing: 6) {
+                                ForEach(1...10, id: \.self) { slotId in
+                                    slotRowCard(slotId: slotId)
+                                }
+                            }
+                            .padding(.horizontal)
+
+                            Button(action: {
+                                dismissKeyboard()
+                                clearAllSlots()
+                            }) {
+                                HStack {
+                                    Image(systemName: "trash")
+                                    Text("🗑️ Clear All Slots")
+                                }
+                                .font(.system(size: 12, weight: .bold))
+                                .foregroundColor(Color(hex: "#EF4444"))
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 38)
+                                .background(Color(hex: "#161B22"))
+                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(hex: "#EF4444"), lineWidth: 1))
+                                .cornerRadius(6)
+                            }
+                            .padding(.horizontal)
+                            .padding(.top, 4)
                         }
 
-                        // ================= 3. IP / WI-FI SYNC CARD =================
+                        // ================= 5. IP / WI-FI SYNC CARD =================
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -250,14 +364,13 @@ public struct ContentView: View {
                             }
 
                             if showPairDialog {
-                                // Inline iOS 15–19 Compatible PC Pairing Box (works on iPhone X through iPhone 17 Pro Max)
                                 VStack(alignment: .leading, spacing: 8) {
-                                    Text("Enter the PC IP shown on your RATT PC toolbar (e.g. 192.168.x.x):")
+                                    Text("Enter the PC IP shown on your RATT PC toolbar (e.g. 10.191.126.253):")
                                         .font(.system(size: 11, weight: .semibold))
                                         .foregroundColor(Color(hex: "#E6EDF3"))
 
                                     HStack(spacing: 8) {
-                                        TextField("PC IP Address (e.g. 192.168.1.100)", text: $pairIpDraft)
+                                        TextField("PC IP Address", text: $pairIpDraft)
                                             .keyboardType(.numbersAndPunctuation)
                                             .autocapitalization(.none)
                                             .disableAutocorrection(true)
@@ -379,112 +492,52 @@ public struct ContentView: View {
                         .cornerRadius(10)
                         .padding(.horizontal)
 
-                        // ================= 4. SAVE TEXT OR CLIPBOARD TO A SLOT =================
+                        // ================= 6. KEYBOARD SETUP & PERMISSION DIAGNOSTICS =================
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
-                                Text("SAVE TEXT OR CLIPBOARD TO A SLOT")
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundColor(Color(hex: "#00BFFF"))
+                                HStack(spacing: 6) {
+                                    Circle()
+                                        .fill(Color(hex: "#39FF14"))
+                                        .frame(width: 8, height: 8)
+                                    Text("RATT KEYBOARD (CHOOSE SLOTS INSIDE ANY APP)")
+                                        .font(.system(size: 10.5, weight: .bold))
+                                        .foregroundColor(Color(hex: "#39FF14"))
+                                }
                                 Spacer()
-                                Button("Hide Keyboard ⌨️↓") {
+                                Button(action: {
                                     dismissKeyboard()
-                                }
-                                .font(.system(size: 10.5, weight: .bold))
-                                .foregroundColor(Color(hex: "#00BFFF"))
-                            }
-
-                            Button(action: {
-                                dismissKeyboard()
-                                showSlotSheet = true
-                            }) {
-                                Text("📥 Save Current iPhone Clipboard to Slot...")
-                                    .font(.system(size: 13, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 40)
-                                    .background(Color(hex: "#00BFFF"))
-                                    .cornerRadius(6)
-                            }
-
-                            HStack(spacing: 6) {
-                                TextField("Or type / paste text here directly...", text: $directInputText)
-                                    .font(.system(size: 13))
-                                    .foregroundColor(.white)
-                                    .padding(10)
-                                    .background(Color(hex: "#0D1117"))
-                                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(hex: "#30363D"), lineWidth: 1))
-                                    .cornerRadius(6)
-
-                                if !directInputText.isEmpty {
-                                    Button(action: {
-                                        directInputText = ""
-                                        dismissKeyboard()
-                                    }) {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .foregroundColor(Color(hex: "#8B949E"))
-                                            .font(.system(size: 18))
+                                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                                        UIApplication.shared.open(url)
                                     }
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "gearshape.fill")
+                                        Text("Open Settings")
+                                    }
+                                    .font(.system(size: 10.5, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 5)
+                                    .background(Color(hex: "#238636"))
+                                    .cornerRadius(6)
                                 }
                             }
 
-                            Text("Tap a slot number below to save typed text (or iPhone clipboard) & copy to clipboard:")
+                            Text("Settings → General → Keyboard → Keyboards → Add 'RATT v2' → Enable 'Allow Full Access'")
                                 .font(.system(size: 10))
                                 .foregroundColor(Color(hex: "#8B949E"))
-
-                            VStack(spacing: 6) {
-                                HStack(spacing: 5) {
-                                    ForEach(1...5, id: \.self) { slotId in
-                                        quickSlotButton(slotId: slotId)
-                                    }
-                                }
-                                HStack(spacing: 5) {
-                                    ForEach(6...10, id: \.self) { slotId in
-                                        quickSlotButton(slotId: slotId)
-                                    }
-                                }
-                            }
                         }
-                        .padding(14)
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .background(Color(hex: "#161B22"))
-                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(hex: "#30363D"), lineWidth: 1))
-                        .cornerRadius(10)
+                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(hex: "#30363D"), lineWidth: 1))
+                        .cornerRadius(8)
                         .padding(.horizontal)
-
-                        // ================= 5. LIVE 10-SLOT PREVIEW (TAP TO COPY TO CLIPBOARD) =================
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("LIVE 10-SLOT PREVIEW (TAP 'COPY' TO COPY TO IPHONE CLIPBOARD)")
-                                .font(.system(size: 10.5, weight: .bold))
-                                .foregroundColor(Color(hex: "#8B949E"))
-                                .padding(.horizontal)
-
-                            VStack(spacing: 6) {
-                                ForEach(1...10, id: \.self) { slotId in
-                                    slotRowCard(slotId: slotId)
-                                }
-                            }
-                            .padding(.horizontal)
-
-                            Button(action: {
-                                dismissKeyboard()
-                                clearAllSlots()
-                            }) {
-                                HStack {
-                                    Image(systemName: "trash")
-                                    Text("🗑️ Clear All Slots")
-                                }
-                                .font(.system(size: 12, weight: .bold))
-                                .foregroundColor(Color(hex: "#EF4444"))
-                                .frame(maxWidth: .infinity)
-                                .frame(height: 38)
-                                .background(Color(hex: "#161B22"))
-                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color(hex: "#EF4444"), lineWidth: 1))
-                                .cornerRadius(6)
-                            }
-                            .padding(.horizontal)
-                            .padding(.top, 4)
+                        .onTapGesture {
+                            dismissKeyboard()
                         }
 
-                        // ================= 6. CROSS-PLATFORM SYNC =================
+                        // ================= 7. CROSS-PLATFORM SYNC =================
                         VStack(alignment: .leading, spacing: 6) {
                             Text("CROSS-PLATFORM SYNC (PREMIUM & ENTERPRISE)")
                                 .font(.system(size: 10, weight: .bold))
@@ -527,7 +580,7 @@ public struct ContentView: View {
                         .padding(.horizontal)
                         .padding(.top, 6)
 
-                        // ================= 7. SHARE, MIRROR & TRANSLATE =================
+                        // ================= 8. SHARE, MIRROR & TRANSLATE =================
                         VStack(alignment: .leading, spacing: 6) {
                             Text("SHARE, MIRROR & 9-LANGUAGE TRANSLATION (PREMIUM & ENTERPRISE)")
                                 .font(.system(size: 10, weight: .bold))
@@ -586,7 +639,7 @@ public struct ContentView: View {
                         .padding(.horizontal)
                         .padding(.top, 4)
 
-                        // ================= 8. EXIT & WIPE SLOTS =================
+                        // ================= 9. EXIT & WIPE SLOTS =================
                         Button(action: {
                             dismissKeyboard()
                             emptySlotsAndExit()
@@ -622,8 +675,6 @@ public struct ContentView: View {
             .onReceive(NotificationCenter.default.publisher(for: .slotCleared)) { _ in
                 refreshSlots()
             }
-            // Only wipe slots when the app is actually terminated (or via the Exit button),
-            // NOT when switching apps to paste or when iOS shows the "Allow Paste" popup!
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.willTerminateNotification)) { _ in
                 emptySlotsOnExit()
             }
@@ -659,49 +710,80 @@ public struct ContentView: View {
             } message: {
                 Text("Sync all 10 slots with your \(crossSyncTarget) device running RATT.")
             }
-            .actionSheet(isPresented: $showSlotSheet) {
-                var buttons: [ActionSheet.Button] = []
-                for s in 1...10 {
-                    buttons.append(.default(Text("Slot #\(s)")) {
-                        saveClipboardToSlot(slotId: s)
-                    })
+            // Background modifier container for the two separate ActionSheets (Paste Picker vs Save Picker)
+            .background(
+                HStack {
+                    Color.clear
+                        .actionSheet(isPresented: $showPasteSlotSheet) {
+                            var buttons: [ActionSheet.Button] = []
+                            for s in 1...10 {
+                                let preview = slotPreviews[s] ?? ""
+                                let label = preview.isEmpty
+                                    ? "Slot #\(s) — [Empty]"
+                                    : "Slot #\(s): \(preview.count > 36 ? String(preview.prefix(36)) + "..." : preview)"
+                                buttons.append(.default(Text(label)) {
+                                    copySlotToIphoneClipboard(slotId: s)
+                                })
+                            }
+                            buttons.append(.cancel())
+                            return ActionSheet(
+                                title: Text("Choose Which Slot (1–10) to Paste"),
+                                message: Text("Select a slot below to load it into your iPhone Clipboard for pasting:"),
+                                buttons: buttons
+                            )
+                        }
+                    Color.clear
+                        .actionSheet(isPresented: $showSaveSlotSheet) {
+                            var buttons: [ActionSheet.Button] = []
+                            for s in 1...10 {
+                                let preview = slotPreviews[s] ?? ""
+                                let label = preview.isEmpty
+                                    ? "Save into Slot #\(s) [Empty]"
+                                    : "Overwrite Slot #\(s) (\(preview.count > 24 ? String(preview.prefix(24)) + "..." : preview))"
+                                buttons.append(.default(Text(label)) {
+                                    saveClipboardToSlot(slotId: s)
+                                })
+                            }
+                            buttons.append(.cancel())
+                            return ActionSheet(
+                                title: Text("Save into Which Slot (1–10)?"),
+                                message: Text("Choose the slot number where you want to store this item:"),
+                                buttons: buttons
+                            )
+                        }
                 }
-                buttons.append(.cancel())
-                return ActionSheet(title: Text("Save Current iPhone Clipboard to Which Slot?"), buttons: buttons)
-            }
+            )
         }
         .navigationViewStyle(StackNavigationViewStyle())
     }
 
     // ================= SUB-VIEWS =================
 
+    /// Quick button in the "1️⃣ CHOOSE WHICH SLOT TO PASTE" grid — ALWAYS selects that slot for pasting!
     @ViewBuilder
-    private func quickSlotButton(slotId: Int) -> some View {
+    private func quickPasteSlotButton(slotId: Int) -> some View {
         let content = slotPreviews[slotId]
         let hasData = content != nil && !content!.isEmpty
+        let isSelectedForPaste = (activePasteSlot == slotId) && hasData
         let slotColor = PC_SLOT_COLORS[slotId - 1]
 
         Button(action: {
             dismissKeyboard()
-            let typed = directInputText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !typed.isEmpty {
-                saveTextToSlotAndClipboard(slotId: slotId, text: typed)
-                directInputText = ""
-            } else if hasData {
+            if hasData {
                 copySlotToIphoneClipboard(slotId: slotId)
             } else {
-                saveClipboardToSlot(slotId: slotId)
+                setStatus("Slot #\(slotId) is empty. Save text into Slot #\(slotId) first.", ok: false)
             }
         }) {
-            Text(hasData ? "● #\(slotId)" : "Slot \(slotId)")
-                .font(.system(size: 11, weight: hasData ? .bold : .regular))
-                .foregroundColor(hasData ? .white : Color(hex: "#8B949E"))
+            Text(isSelectedForPaste ? "✓ #\(slotId)" : (hasData ? "Paste #\(slotId)" : "Slot \(slotId)"))
+                .font(.system(size: 10.5, weight: hasData ? .bold : .regular))
+                .foregroundColor(isSelectedForPaste ? .black : (hasData ? .white : Color(hex: "#6E7681")))
                 .frame(maxWidth: .infinity)
                 .frame(height: 36)
-                .background(hasData ? Color(hex: "#133024") : Color(hex: "#161B22"))
+                .background(isSelectedForPaste ? Color(hex: "#39FF14") : (hasData ? Color(hex: "#133024") : Color(hex: "#161B22")))
                 .overlay(
                     RoundedRectangle(cornerRadius: 6)
-                        .stroke(hasData ? slotColor : Color(hex: "#30363D"), lineWidth: 1)
+                        .stroke(isSelectedForPaste ? Color.white : (hasData ? slotColor : Color(hex: "#30363D")), lineWidth: isSelectedForPaste ? 2 : 1)
                 )
                 .cornerRadius(6)
         }
@@ -711,17 +793,18 @@ public struct ContentView: View {
     private func slotRowCard(slotId: Int) -> some View {
         let content = slotPreviews[slotId]
         let hasData = content != nil && !content!.isEmpty
+        let isSelectedForPaste = (activePasteSlot == slotId) && hasData
         let slotColor = PC_SLOT_COLORS[slotId - 1]
 
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             RoundedRectangle(cornerRadius: 2)
                 .fill(hasData ? slotColor : Color(hex: "#21262D"))
-                .frame(width: 4, height: 26)
+                .frame(width: 4, height: 28)
 
             Text("#\(slotId)")
                 .font(.system(size: 11.5, weight: .bold))
                 .foregroundColor(hasData ? .white : slotColor)
-                .frame(width: 32, height: 24)
+                .frame(width: 30, height: 24)
                 .background(hasData ? slotColor : Color(hex: "#161B22"))
                 .overlay(
                     RoundedRectangle(cornerRadius: 4)
@@ -731,7 +814,7 @@ public struct ContentView: View {
 
             if hasData {
                 Text(content!)
-                    .font(.system(size: 13, weight: .bold))
+                    .font(.system(size: 12.5, weight: .bold))
                     .foregroundColor(.white)
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -742,44 +825,38 @@ public struct ContentView: View {
                     }
             } else {
                 Text("Slot \(slotId): [Empty]")
-                    .font(.system(size: 13))
+                    .font(.system(size: 12.5))
                     .foregroundColor(Color(hex: "#6E7681"))
                     .lineLimit(1)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
             if hasData {
-                // Dedicated Copy Button -> Writes slot directly to iPhone System Clipboard
+                // Choose This Slot to Paste Button
                 Button(action: {
                     dismissKeyboard()
                     copySlotToIphoneClipboard(slotId: slotId)
                 }) {
-                    Text("Copy")
-                        .font(.system(size: 11, weight: .bold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 10)
-                        .frame(height: 30)
-                        .background(Color(hex: "#00BFFF"))
+                    Text(isSelectedForPaste ? "✓ Ready" : "Paste This")
+                        .font(.system(size: 10.5, weight: .bold))
+                        .foregroundColor(isSelectedForPaste ? .black : .white)
+                        .padding(.horizontal, 8)
+                        .frame(height: 28)
+                        .background(isSelectedForPaste ? Color(hex: "#39FF14") : Color(hex: "#00BFFF"))
                         .cornerRadius(4)
                 }
             }
 
-            // Save Button -> Saves typed text or current iPhone Clipboard into this Slot
+            // Save Button -> Saves typed text or external clipboard into this Slot
             Button(action: {
                 dismissKeyboard()
-                let typed = directInputText.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !typed.isEmpty {
-                    saveTextToSlotAndClipboard(slotId: slotId, text: typed)
-                    directInputText = ""
-                } else {
-                    saveClipboardToSlot(slotId: slotId)
-                }
+                saveClipboardToSlot(slotId: slotId)
             }) {
                 Text("Save")
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.system(size: 10.5, weight: .semibold))
                     .foregroundColor(Color(hex: "#C9D1D9"))
-                    .padding(.horizontal, 9)
-                    .frame(height: 30)
+                    .padding(.horizontal, 8)
+                    .frame(height: 28)
                     .background(Color(hex: "#21262D"))
                     .cornerRadius(4)
             }
@@ -788,20 +865,20 @@ public struct ContentView: View {
                 dismissKeyboard()
                 clearSlot(slotId: slotId)
             }) {
-                Text("Clear")
-                    .font(.system(size: 11))
+                Text("X")
+                    .font(.system(size: 10.5, weight: .bold))
                     .foregroundColor(Color(hex: "#EF4444"))
-                    .padding(.horizontal, 8)
-                    .frame(height: 30)
+                    .padding(.horizontal, 7)
+                    .frame(height: 28)
                     .background(Color(hex: "#21262D"))
                     .cornerRadius(4)
             }
         }
         .padding(8)
-        .background(hasData ? Color(hex: "#10241B") : Color(hex: "#12161C"))
+        .background(isSelectedForPaste ? Color(hex: "#143828") : (hasData ? Color(hex: "#10241B") : Color(hex: "#12161C")))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
-                .stroke(hasData ? slotColor : Color(hex: "#21262D"), lineWidth: hasData ? 2 : 1)
+                .stroke(isSelectedForPaste ? Color(hex: "#39FF14") : (hasData ? slotColor : Color(hex: "#21262D")), lineWidth: (isSelectedForPaste || hasData) ? 2 : 1)
         )
         .cornerRadius(8)
     }
@@ -818,6 +895,7 @@ public struct ContentView: View {
         self.pcIpAddress = savedPc
         self.iphoneIpAddress = dataManager.getDeviceIpAddress()
         self.userTier = RattUserTier(rawValue: store.getUserTier()) ?? .basic
+        self.activePasteSlot = UserDefaults.standard.integer(forKey: "ratt_active_paste_slot")
     }
 
     private func refreshSlots() {
@@ -830,10 +908,13 @@ public struct ContentView: View {
             }
         }
         slotPreviews = loaded
+        if activePasteSlot > 0 && loaded[activePasteSlot] == nil {
+            activePasteSlot = 0
+        }
     }
 
-    /// Saves text into a RATT Slot AND copies it to the iPhone System Clipboard (`UIPasteboard.general`).
-    private func saveTextToSlotAndClipboard(slotId: Int, text: String) {
+    /// Saves text into `slotId` WITHOUT overwriting the user's chosen paste slot or other slots.
+    private func saveTextToSlot(slotId: Int, text: String) {
         if !store.isAllowedPayloadForTier(text) {
             upgradeReason = "UPGRADE REQUIRED: Copying Document & Media files (.docx, .xls, .pdf, .mp4, etc.) is limited to Premium and Enterprise subscribers."
             showUpgradeAlert = true
@@ -841,53 +922,64 @@ public struct ContentView: View {
         }
         let okStore = store.encryptAndStore(slot: slotId, text: text)
         let okGroup = dataManager.saveSlot(id: slotId, content: text)
-        UIPasteboard.general.string = text
-        let generator = UINotificationFeedbackGenerator()
-        generator.notificationOccurred(.success)
+        lastSavedTexts.insert(text)
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
         sendSlotToPc(slotId: slotId, text: text)
         refreshSlots()
         if okStore || okGroup {
-            setStatus("✅ Saved to Slot #\(slotId) & Copied to iPhone Clipboard!", ok: true)
+            // If no active paste slot was selected yet, or if saving into the active paste slot, load it for paste
+            if activePasteSlot == 0 || activePasteSlot == slotId {
+                activePasteSlot = slotId
+                UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
+                UIPasteboard.general.string = text
+            }
+            setStatus("✅ Saved to Slot #\(slotId)! Tap any slot in Section 1️⃣ to choose which slot to paste.", ok: true)
         } else {
             setStatus("⚠️ Security Guard blocked unsafe link or script in Slot #\(slotId).", ok: false)
         }
     }
 
-    /// Copies an existing RATT Slot directly into the iPhone System Clipboard (`UIPasteboard.general`).
+    /// Explicitly chooses `slotId` (1–10) as the Active Paste Slot and loads it into `UIPasteboard.general`.
     private func copySlotToIphoneClipboard(slotId: Int) {
         if let slotObj = dataManager.loadSlot(id: slotId) {
             if slotObj.kind == "image", let b64 = slotObj.dataBase64, let imgData = Data(base64Encoded: b64), let img = UIImage(data: imgData) {
                 UIPasteboard.general.image = img
+                activePasteSlot = slotId
+                UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
-                setStatus("📋 Copied Image from Slot #\(slotId) to iPhone Clipboard!", ok: true)
+                setStatus("📋 Selected Slot #\(slotId) (Image) for Paste!", ok: true)
                 return
             }
             if !slotObj.content.isEmpty {
                 UIPasteboard.general.string = slotObj.content
+                activePasteSlot = slotId
+                UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
                 UINotificationFeedbackGenerator().notificationOccurred(.success)
-                setStatus("📋 Copied Slot #\(slotId) to iPhone Clipboard — ready to paste!", ok: true)
+                setStatus("📋 Slot #\(slotId) is now Active for Paste! Go to any app and tap Paste.", ok: true)
                 return
             }
         }
         if let txt = slotPreviews[slotId] ?? store.decryptSlot(slotId), !txt.isEmpty {
             UIPasteboard.general.string = txt
+            activePasteSlot = slotId
+            UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
             UINotificationFeedbackGenerator().notificationOccurred(.success)
-            setStatus("📋 Copied Slot #\(slotId) to iPhone Clipboard — ready to paste!", ok: true)
+            setStatus("📋 Slot #\(slotId) is now Active for Paste! Go to any app and tap Paste.", ok: true)
         } else {
-            setStatus("Slot #\(slotId) is empty. Type text or copy something first.", ok: false)
+            setStatus("Slot #\(slotId) is empty. Save text into Slot #\(slotId) first.", ok: false)
         }
     }
 
-    /// Reads the current iPhone System Clipboard (`UIPasteboard.general`) and saves it into `slotId`.
+    /// Saves typed text (or a new external item from the iPhone Clipboard) into `slotId`.
     private func saveClipboardToSlot(slotId: Int) {
         let typed = directInputText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !typed.isEmpty {
-            saveTextToSlotAndClipboard(slotId: slotId, text: typed)
+            saveTextToSlot(slotId: slotId, text: typed)
             directInputText = ""
             return
         }
         if let clip = UIPasteboard.general.string, !clip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            saveTextToSlotAndClipboard(slotId: slotId, text: clip)
+            saveTextToSlot(slotId: slotId, text: clip)
         } else if let img = UIPasteboard.general.image, let pngData = img.pngData() {
             let b64 = pngData.base64EncodedString()
             let desc = "Image [\(Int(img.size.width))x\(Int(img.size.height))]"
@@ -897,13 +989,17 @@ public struct ContentView: View {
             refreshSlots()
             setStatus("✅ Saved iPhone Clipboard Image to Slot #\(slotId)!", ok: true)
         } else {
-            setStatus("iPhone Clipboard is empty. Type text in the box above or copy text in any app first.", ok: false)
+            setStatus("Type text in the box above or copy text in another app first, then tap Save.", ok: false)
         }
     }
 
     private func clearSlot(slotId: Int) {
         dataManager.clearSlot(id: slotId)
         store.clearSlot(slotId)
+        if activePasteSlot == slotId {
+            activePasteSlot = 0
+            UserDefaults.standard.set(0, forKey: "ratt_active_paste_slot")
+        }
         sendClearSlotToPc(slotId: slotId)
         refreshSlots()
         setStatus("🗑️ Cleared Slot #\(slotId)", ok: true)
@@ -912,6 +1008,8 @@ public struct ContentView: View {
     private func clearAllSlots() {
         dataManager.clearAllSlots()
         store.clearAllSlots()
+        activePasteSlot = 0
+        UserDefaults.standard.set(0, forKey: "ratt_active_paste_slot")
         sendClearAllToPc()
         refreshSlots()
         setStatus("🗑️ Cleared all 10 slots", ok: true)
@@ -920,6 +1018,7 @@ public struct ContentView: View {
     private func emptySlotsOnExit() {
         dataManager.exitAndWipeAllSlots()
         store.exitAndWipeAllSlots()
+        activePasteSlot = 0
         slotPreviews.removeAll()
     }
 
@@ -964,7 +1063,6 @@ public struct ContentView: View {
         }
     }
 
-    /// Handshake with RATT PC on port 49211 / 49210 to exchange sync token and synchronize all 10 slots.
     private func pairAndSyncWithPc(_ targetIp: String) {
         setStatus("🔗 Pairing with PC (\(targetIp))...", ok: true)
         let myIp = dataManager.getDeviceIpAddress()
@@ -986,7 +1084,7 @@ public struct ContentView: View {
                 "nonce": UUID().uuidString
             ]
             req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-            URLSession.shared.dataTask(with: req) { data, resp, err in
+            URLSession.shared.dataTask(with: req) { data, _, _ in
                 if let data = data,
                    let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let pcTok = json["sync_token"] as? String, !pcTok.isEmpty {
@@ -1030,10 +1128,7 @@ public struct ContentView: View {
                 }
                 DispatchQueue.main.async {
                     self.refreshSlots()
-                    if let slot1 = self.store.decryptSlot(1), !slot1.isEmpty {
-                        UIPasteboard.general.string = slot1
-                    }
-                    self.setStatus("✅ Pulled \(pulled) slot(s) from PC (\(self.pcIpAddress))!", ok: true)
+                    self.setStatus("✅ Pulled \(pulled) slot(s) from PC! Tap any slot in Section 1️⃣ to choose which slot to paste.", ok: true)
                 }
             }.resume()
         }
