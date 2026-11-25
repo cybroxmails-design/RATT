@@ -1,24 +1,28 @@
-// iOS RattKeyboardViewController.swift - Slot Palette & Deletion Handling
-// (`mobile_implimentation.pdf` Section 6: Phase 3 iPhone Slot Palette Extension)
-//
-// Because iOS strictly prohibits floating pop-ups over third-party apps, RATT for iPhone
-// utilizes Apple's official UIInputViewController. The user stays on their standard Apple
-// keyboard for typing; tapping the Globe ([GLOBE]) icon expands the RATT Slot Palette
-// showing 10 cards synced from the desktop.
+// iOS RattKeyboardViewController.swift - "Paste from RATT" In-Place Filled Slot Chooser
+// When the user clicks "📋 Paste from RATT" on the RATT iOS Keyboard, the slots that contain
+// data appear at the exact same place so the user can choose which slot to paste from.
 
 import UIKit
 
 class RattKeyboardViewController: UIInputViewController {
     private let dataManager = AppGroupDataManager.shared
     private let slotStore = KeychainSlotStore.shared
-    private var slotCards: [Int: UIButton] = [:]
     private var statusBanner: UILabel?
+    private var pasteFromRattBtn: UIButton?
+    private var filledSlotsScroll: UIScrollView?
+    private var filledSlotsStack: UIStackView?
+    private var showingSlotChoices: Bool = false
+
+    private let pcSlotHexColors = [
+        "#00BFFF", "#10B981", "#F59E0B", "#8B5CF6", "#EC4899",
+        "#3B82F6", "#14B8A6", "#EF4444", "#EAB308", "#06B6D4"
+    ]
 
     override func viewDidLoad() {
         super.viewDidLoad()
         _ = SecurityHardening.enforceRuntimeDefense()
         view.backgroundColor = UIColor(red: 0.05, green: 0.08, blue: 0.13, alpha: 1.0)
-        setupSlotPaletteGrid()
+        setupKeyboardLayout()
         observeDarwinDeletionNotification()
         NotificationCenter.default.addObserver(
             self,
@@ -28,22 +32,13 @@ class RattKeyboardViewController: UIInputViewController {
         )
     }
 
-    @objc private func clearAllPaletteSlots() {
-        dataManager.clearAllSlots()
-        slotStore.clearAllSlots()
-        refreshPaletteCards()
-        statusBanner?.text = "Cleared all 10 slots"
-    }
-
     override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
         _ = dataManager.importSlotsFromPasteboardCarrier()
-        refreshPaletteCards()
+        rebuildFilledSlotChoices()
         pullSlotsFromLocalhostIfAvailable()
     }
 
-    /// Fallback for Sideloadly Free Apple ID installs where App Group entitlement is stripped:
-    /// Fetches all 10 slots from the local RATT container app listener on 127.0.0.1:49211.
     private func pullSlotsFromLocalhostIfAvailable() {
         guard let url = URL(string: "http://127.0.0.1:49211/get_all_slots") else { return }
         var req = URLRequest(url: url)
@@ -59,24 +54,21 @@ class RattKeyboardViewController: UIInputViewController {
             }
             var updated = false
             for (k, v) in slots {
-                if let sId = Int(k), (1...10).contains(sId), !v.isEmpty {
-                    _ = self.slotStore.encryptAndStore(slot: sId, text: v)
-                    _ = self.dataManager.saveSlot(id: sId, content: v)
-                    updated = true
+                if let sId = Int(k), (1...10).contains(sId) {
+                    if !v.isEmpty {
+                        _ = self.slotStore.encryptAndStore(slot: sId, text: v)
+                        _ = self.dataManager.saveSlot(id: sId, content: v)
+                        updated = true
+                    }
                 }
             }
             if updated {
                 DispatchQueue.main.async {
-                    self.refreshPaletteCards()
+                    self.rebuildFilledSlotChoices()
                 }
             }
         }.resume()
     }
-
-    private let pcSlotHexColors = [
-        "#00BFFF", "#10B981", "#F59E0B", "#8B5CF6", "#EC4899",
-        "#3B82F6", "#14B8A6", "#EF4444", "#EAB308", "#06B6D4"
-    ]
 
     private func colorFromHex(_ hex: String) -> UIColor {
         var int: UInt64 = 0
@@ -88,104 +80,25 @@ class RattKeyboardViewController: UIInputViewController {
         return UIColor(red: r, green: g, blue: b, alpha: 1.0)
     }
 
-    func didSelectSlot(_ slot: RattSlot) {
-        guard slotStore.canAccessSlot(slot.id) else {
-            statusBanner?.text = "Slot #\(slot.id) is not available on your plan."
-            return
-        }
-        // IOS-03: Use localOnly + 60s expiration so sensitive items never leak via Universal Clipboard
-        let pasteOpts: [UIPasteboard.OptionsKey: Any] = [
-            .localOnly: true,
-            .expirationDate: Date().addingTimeInterval(60)
-        ]
-        // Phase 1: Native Images
-        if slot.kind == "image" || slot.kind == "diagram" {
-            if let dataB64 = slot.dataBase64, let imgData = Data(base64Encoded: dataB64), UIImage(data: imgData) != nil {
-                UIPasteboard.general.setItems([["public.png": imgData]], options: pasteOpts)
-                let generator = UINotificationFeedbackGenerator()
-                generator.notificationOccurred(.success)
-                statusBanner?.text = "Image Slot #\(slot.id) copied locally (60s TTL)."
-                return
-            }
-        }
-        // Phase 3: Documents and Media
-        if slot.kind == "files" {
-            let docName = slot.fileName ?? "Document"
-            guard RattSecurityGuard.isSafeFileName(docName) else {
-                statusBanner?.text = "Blocked unsafe file type: \(docName)"
-                return
-            }
-            if let dataB64 = slot.dataBase64, let fileData = Data(base64Encoded: dataB64) {
-                let mime = slot.mimeType ?? "public.data"
-                UIPasteboard.general.setItems([[mime: fileData, "public.data": fileData]], options: pasteOpts)
-            }
-            let generator = UINotificationFeedbackGenerator()
-            generator.notificationOccurred(.success)
-            statusBanner?.text = "\(docName) copied locally (60s TTL)."
-            return
-        }
-        // IOS-03: Prevent accidental clipboard injection into secure password fields
-        if self.textDocumentProxy.isSecureTextEntry == true {
-            statusBanner?.text = "Injection blocked on secure password field."
-            return
-        }
-        let (isSafe, clean) = RattSecurityGuard.sanitizeText(slot.content)
-        if isSafe {
-            self.textDocumentProxy.insertText(clean)
-            statusBanner?.text = "Injected Slot #\(slot.id) • Hold to clear"
-        }
-    }
-
-    @objc private func handleCardLongPress(_ gesture: UILongPressGestureRecognizer) {
-        if gesture.state == .began, let btn = gesture.view as? UIButton {
-            let slotId = btn.tag
-            dataManager.clearSlot(id: slotId)
-            slotStore.clearSlot(slotId)
-            refreshPaletteCards()
-            statusBanner?.text = "Cleared Slot #\(slotId)"
-        }
-    }
-
-    func observeDarwinDeletionNotification() {
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-            nil, { _, _, _, _, _ in NotificationCenter.default.post(name: .slotCleared, object: nil) },
-            "com.cybrox.ratt.slotCleared" as CFString, nil, .deliverImmediately)
-    }
-
-    @objc private func handleSlotClearedNotification() {
-        DispatchQueue.main.async { [weak self] in
-            self?.refreshPaletteCards()
-            self?.statusBanner?.text = "Slot cleared from PC (<100ms)"
-        }
-    }
-
-    func setupSlotPaletteGrid() {
+    private func setupKeyboardLayout() {
+        // 1. Header Bar
         let header = UIView(frame: CGRect(x: 0, y: 0, width: view.bounds.width, height: 30))
         header.autoresizingMask = [.flexibleWidth]
         header.backgroundColor = UIColor(red: 0.04, green: 0.07, blue: 0.11, alpha: 1.0)
 
-        let title = UILabel(frame: CGRect(x: 12, y: 5, width: 170, height: 20))
-        title.text = "RATT v2 Slot Palette"
+        let title = UILabel(frame: CGRect(x: 10, y: 5, width: 120, height: 20))
+        title.text = "RATT v2 Keyboard"
         title.font = UIFont.boldSystemFont(ofSize: 12)
-        title.textColor = UIColor(red: 0.01, green: 0.65, blue: 0.98, alpha: 1.0)
+        title.textColor = UIColor(red: 0.01, green: 0.75, blue: 1.0, alpha: 1.0)
         header.addSubview(title)
 
-        let banner = UILabel(frame: CGRect(x: 185, y: 5, width: max(120, view.bounds.width - 230), height: 20))
+        let banner = UILabel(frame: CGRect(x: 132, y: 5, width: max(120, view.bounds.width - 178), height: 20))
         banner.autoresizingMask = [.flexibleWidth]
         banner.font = UIFont.systemFont(ofSize: 11)
-        banner.textColor = UIColor(white: 0.75, alpha: 1.0)
-        banner.text = "Tap a slot card to inject • Tap 🌐 for Apple Keyboard"
+        banner.textColor = UIColor(white: 0.80, alpha: 1.0)
+        banner.text = "Tap 'Paste from RATT' to choose a slot"
         header.addSubview(banner)
         self.statusBanner = banner
-
-        let clearAllBtn = UIButton(type: .system)
-        clearAllBtn.frame = CGRect(x: view.bounds.width - 96, y: 3, width: 54, height: 24)
-        clearAllBtn.autoresizingMask = [.flexibleLeftMargin]
-        clearAllBtn.setTitle("Clear All", for: .normal)
-        clearAllBtn.titleLabel?.font = UIFont.boldSystemFont(ofSize: 10.5)
-        clearAllBtn.setTitleColor(UIColor(red: 0.94, green: 0.27, blue: 0.27, alpha: 1.0), for: .normal)
-        clearAllBtn.addTarget(self, action: #selector(clearAllPaletteSlots), for: .touchUpInside)
-        header.addSubview(clearAllBtn)
 
         let globeBtn = UIButton(type: .system)
         globeBtn.frame = CGRect(x: view.bounds.width - 38, y: 3, width: 32, height: 24)
@@ -196,76 +109,213 @@ class RattKeyboardViewController: UIInputViewController {
 
         view.addSubview(header)
 
-        let gridContainer = UIStackView(frame: CGRect(x: 8, y: 34, width: view.bounds.width - 16, height: 156))
-        gridContainer.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        gridContainer.axis = .vertical
-        gridContainer.distribution = .fillEqually
-        gridContainer.spacing = 6
+        // 2. Main Interactive Area (y: 36, height: 110)
+        // Here resides the "📋 Paste from RATT" button AND at the exact same place the filled slot choices!
+        let mainAreaFrame = CGRect(x: 10, y: 36, width: view.bounds.width - 20, height: 110)
 
-        for rowIdx in 0..<2 {
-            let rowStack = UIStackView()
-            rowStack.axis = .horizontal
-            rowStack.distribution = .fillEqually
-            rowStack.spacing = 6
+        let pasteBtn = UIButton(type: .system)
+        pasteBtn.frame = mainAreaFrame
+        pasteBtn.autoresizingMask = [.flexibleWidth]
+        pasteBtn.setTitle("📋 Paste from RATT (Tap to Choose Slot)", for: .normal)
+        pasteBtn.titleLabel?.font = UIFont.boldSystemFont(ofSize: 15)
+        pasteBtn.setTitleColor(.black, for: .normal)
+        pasteBtn.backgroundColor = UIColor(red: 0.22, green: 1.0, blue: 0.08, alpha: 1.0)
+        pasteBtn.layer.cornerRadius = 10
+        pasteBtn.layer.borderWidth = 2
+        pasteBtn.layer.borderColor = UIColor.white.cgColor
+        pasteBtn.addTarget(self, action: #selector(onPasteFromRattTapped), for: .touchUpInside)
+        view.addSubview(pasteBtn)
+        self.pasteFromRattBtn = pasteBtn
 
-            for colIdx in 1...5 {
-                let slotId = rowIdx * 5 + colIdx
-                let card = UIButton(type: .system)
-                card.tag = slotId
-                card.titleLabel?.font = UIFont.boldSystemFont(ofSize: 11)
-                card.titleLabel?.numberOfLines = 2
-                card.titleLabel?.textAlignment = .center
-                card.setTitle("Slot \(slotId)\n[Empty]", for: .normal)
-                card.setTitleColor(UIColor(white: 0.70, alpha: 1.0), for: .normal)
-                card.backgroundColor = UIColor(red: 0.09, green: 0.13, blue: 0.20, alpha: 1.0)
-                card.layer.cornerRadius = 6
-                card.layer.borderWidth = 1
-                card.layer.borderColor = UIColor(white: 0.25, alpha: 1.0).cgColor
+        // Scrollable container AT THE EXACT SAME PLACE (`mainAreaFrame`) showing all slots that contain data!
+        let scroll = UIScrollView(frame: mainAreaFrame)
+        scroll.autoresizingMask = [.flexibleWidth]
+        scroll.showsVerticalScrollIndicator = true
+        scroll.backgroundColor = UIColor(red: 0.07, green: 0.10, blue: 0.15, alpha: 1.0)
+        scroll.layer.cornerRadius = 10
+        scroll.layer.borderWidth = 1.5
+        scroll.layer.borderColor = UIColor(red: 0.22, green: 1.0, blue: 0.08, alpha: 1.0).cgColor
+        scroll.isHidden = true
 
-                let longPress = UILongPressGestureRecognizer(target: self, action: #selector(handleCardLongPress(_:)))
-                card.addGestureRecognizer(longPress)
+        let stack = UIStackView()
+        stack.axis = .vertical
+        stack.spacing = 6
+        stack.distribution = .fillEqually
+        scroll.addSubview(stack)
+        view.addSubview(scroll)
+        self.filledSlotsScroll = scroll
+        self.filledSlotsStack = stack
 
-                card.addAction(UIAction { [weak self] _ in
-                    guard let self = self else { return }
-                    if let slot = self.dataManager.loadSlot(id: slotId) {
-                        self.didSelectSlot(slot)
-                    } else {
-                        self.statusBanner?.text = "Slot #\(slotId) is [Empty]"
-                    }
-                }, for: .touchUpInside)
+        // 3. Bottom Utility Row (Space, Backspace, Return, Back to Paste from RATT)
+        let bottomRow = UIStackView(frame: CGRect(x: 10, y: 152, width: view.bounds.width - 20, height: 34))
+        bottomRow.autoresizingMask = [.flexibleWidth]
+        bottomRow.axis = .horizontal
+        bottomRow.spacing = 6
+        bottomRow.distribution = .fillEqually
 
-                slotCards[slotId] = card
-                rowStack.addArrangedSubview(card)
-            }
-            gridContainer.addArrangedSubview(rowStack)
-        }
+        let chooseBtn = UIButton(type: .system)
+        chooseBtn.setTitle("📋 Choose Slot", for: .normal)
+        chooseBtn.titleLabel?.font = UIFont.boldSystemFont(ofSize: 11.5)
+        chooseBtn.setTitleColor(UIColor(red: 0.22, green: 1.0, blue: 0.08, alpha: 1.0), for: .normal)
+        chooseBtn.backgroundColor = UIColor(red: 0.09, green: 0.14, blue: 0.22, alpha: 1.0)
+        chooseBtn.layer.cornerRadius = 6
+        chooseBtn.addTarget(self, action: #selector(onPasteFromRattTapped), for: .touchUpInside)
+        bottomRow.addArrangedSubview(chooseBtn)
 
-        view.addSubview(gridContainer)
-        refreshPaletteCards()
+        let spaceBtn = UIButton(type: .system)
+        spaceBtn.setTitle("Space", for: .normal)
+        spaceBtn.titleLabel?.font = UIFont.boldSystemFont(ofSize: 12)
+        spaceBtn.setTitleColor(.white, for: .normal)
+        spaceBtn.backgroundColor = UIColor(red: 0.13, green: 0.17, blue: 0.23, alpha: 1.0)
+        spaceBtn.layer.cornerRadius = 6
+        spaceBtn.addAction(UIAction { [weak self] _ in
+            self?.textDocumentProxy.insertText(" ")
+        }, for: .touchUpInside)
+        bottomRow.addArrangedSubview(spaceBtn)
+
+        let bkspBtn = UIButton(type: .system)
+        bkspBtn.setTitle("⌫ Delete", for: .normal)
+        bkspBtn.titleLabel?.font = UIFont.boldSystemFont(ofSize: 12)
+        bkspBtn.setTitleColor(.white, for: .normal)
+        bkspBtn.backgroundColor = UIColor(red: 0.13, green: 0.17, blue: 0.23, alpha: 1.0)
+        bkspBtn.layer.cornerRadius = 6
+        bkspBtn.addAction(UIAction { [weak self] _ in
+            self?.textDocumentProxy.deleteBackward()
+        }, for: .touchUpInside)
+        bottomRow.addArrangedSubview(bkspBtn)
+
+        let retBtn = UIButton(type: .system)
+        retBtn.setTitle("↵ Return", for: .normal)
+        retBtn.titleLabel?.font = UIFont.boldSystemFont(ofSize: 12)
+        retBtn.setTitleColor(.white, for: .normal)
+        retBtn.backgroundColor = UIColor(red: 0.01, green: 0.52, blue: 0.78, alpha: 1.0)
+        retBtn.layer.cornerRadius = 6
+        retBtn.addAction(UIAction { [weak self] _ in
+            self?.textDocumentProxy.insertText("\n")
+        }, for: .touchUpInside)
+        bottomRow.addArrangedSubview(retBtn)
+
+        view.addSubview(bottomRow)
     }
 
-    func refreshPaletteCards() {
-        for (slotId, card) in slotCards {
-            let isUnlocked = slotStore.canAccessSlot(slotId)
-            let color = colorFromHex(pcSlotHexColors[slotId - 1])
+    @objc private func onPasteFromRattTapped() {
+        _ = dataManager.importSlotsFromPasteboardCarrier()
+        showingSlotChoices = true
+        rebuildFilledSlotChoices()
+    }
 
-            if !isUnlocked {
-                card.setTitle("🔒 Slot \(slotId)\n[Locked]", for: .normal)
-                card.setTitleColor(UIColor(white: 0.40, alpha: 1.0), for: .normal)
-                card.layer.borderColor = UIColor(white: 0.18, alpha: 1.0).cgColor
-            } else if let slot = dataManager.loadSlot(id: slotId), !slot.content.isEmpty {
-                let badge = slot.kind == "image" ? "🖼️ " : (slot.kind == "files" ? "📄 " : "")
-                let preview = slot.content.count > 14 ? String(slot.content.prefix(12)) + ".." : slot.content
-                card.setTitle("Slot \(slotId)\n\(badge)\(preview)", for: .normal)
-                card.setTitleColor(UIColor.white, for: .normal)
-                card.layer.borderColor = color.cgColor
-                card.layer.borderWidth = 1.5
-            } else {
-                card.setTitle("Slot \(slotId)\n[Empty]", for: .normal)
-                card.setTitleColor(UIColor(white: 0.65, alpha: 1.0), for: .normal)
-                card.layer.borderColor = UIColor(white: 0.25, alpha: 1.0).cgColor
-                card.layer.borderWidth = 1.0
+    private func getFilledSlots() -> [(Int, RattSlot)] {
+        var result: [(Int, RattSlot)] = []
+        for sId in 1...10 {
+            if let slot = dataManager.loadSlot(id: sId), !slot.content.isEmpty {
+                result.append((sId, slot))
+            } else if let txt = slotStore.decryptSlot(sId), !txt.isEmpty {
+                result.append((sId, RattSlot(id: sId, content: txt)))
             }
+        }
+        return result
+    }
+
+    func rebuildFilledSlotChoices() {
+        guard let scroll = filledSlotsScroll,
+              let stack = filledSlotsStack,
+              let pasteBtn = pasteFromRattBtn else { return }
+
+        for sub in stack.arrangedSubviews {
+            stack.removeArrangedSubview(sub)
+            sub.removeFromSuperview()
+        }
+
+        let filled = getFilledSlots()
+        pasteBtn.setTitle(
+            filled.isEmpty
+                ? "📋 Paste from RATT (No Slots Saved Yet)"
+                : "📋 Paste from RATT (\(filled.count) Slot\(filled.count == 1 ? "" : "s") Ready — Tap to Choose)",
+            for: .normal
+        )
+
+        if !showingSlotChoices {
+            pasteBtn.isHidden = false
+            scroll.isHidden = true
+            return
+        }
+
+        // Show filled slots AT THE EXACT SAME PLACE as the "Paste from RATT" button!
+        pasteBtn.isHidden = true
+        scroll.isHidden = false
+
+        if filled.isEmpty {
+            let emptyBtn = UIButton(type: .system)
+            emptyBtn.setTitle("No slots contain data yet. Save text in RATT first (Tap to close)", for: .normal)
+            emptyBtn.titleLabel?.font = UIFont.boldSystemFont(ofSize: 12)
+            emptyBtn.setTitleColor(UIColor(white: 0.75, alpha: 1.0), for: .normal)
+            emptyBtn.addAction(UIAction { [weak self] _ in
+                self?.showingSlotChoices = false
+                self?.rebuildFilledSlotChoices()
+            }, for: .touchUpInside)
+            stack.addArrangedSubview(emptyBtn)
+            stack.frame = CGRect(x: 6, y: 6, width: scroll.bounds.width - 12, height: 40)
+            scroll.contentSize = CGSize(width: scroll.bounds.width, height: 52)
+            return
+        }
+
+        let rowHeight: CGFloat = 34
+        for (slotId, slot) in filled {
+            let btn = UIButton(type: .system)
+            let color = colorFromHex(pcSlotHexColors[slotId - 1])
+            let preview = slot.content.replacingOccurrences(of: "\n", with: " ")
+            let trimmedPreview = preview.count > 38 ? String(preview.prefix(36)) + "..." : preview
+            btn.setTitle("  Slot #\(slotId):  \(trimmedPreview)", for: .normal)
+            btn.contentHorizontalAlignment = .left
+            btn.titleLabel?.font = UIFont.boldSystemFont(ofSize: 12.5)
+            btn.setTitleColor(.white, for: .normal)
+            btn.backgroundColor = UIColor(red: 0.08, green: 0.18, blue: 0.14, alpha: 1.0)
+            btn.layer.cornerRadius = 6
+            btn.layer.borderWidth = 1.5
+            btn.layer.borderColor = color.cgColor
+
+            btn.addAction(UIAction { [weak self] _ in
+                self?.didSelectSlot(slot)
+            }, for: .touchUpInside)
+
+            stack.addArrangedSubview(btn)
+        }
+
+        let totalHeight = CGFloat(filled.count) * (rowHeight + 6)
+        stack.frame = CGRect(x: 6, y: 6, width: scroll.bounds.width - 12, height: max(rowHeight, totalHeight - 6))
+        scroll.contentSize = CGSize(width: scroll.bounds.width, height: totalHeight + 12)
+        statusBanner?.text = "Tap any slot below to paste it:"
+    }
+
+    func didSelectSlot(_ slot: RattSlot) {
+        if self.textDocumentProxy.isSecureTextEntry == true {
+            statusBanner?.text = "Injection blocked on secure password field."
+            return
+        }
+        let (isSafe, clean) = RattSecurityGuard.sanitizeText(slot.content)
+        if isSafe {
+            self.textDocumentProxy.insertText(clean)
+            UINotificationFeedbackGenerator().notificationOccurred(.success)
+            statusBanner?.text = "✅ Pasted Slot #\(slot.id)!"
+        }
+    }
+
+    func observeDarwinDeletionNotification() {
+        CFNotificationCenterAddObserver(
+            CFNotificationCenterGetDarwinNotifyCenter(),
+            nil,
+            { _, _, _, _, _ in NotificationCenter.default.post(name: .slotCleared, object: nil) },
+            "com.cybrox.ratt.slotCleared" as CFString,
+            nil,
+            .deliverImmediately
+        )
+    }
+
+    @objc private func handleSlotClearedNotification() {
+        DispatchQueue.main.async { [weak self] in
+            _ = self?.dataManager.importSlotsFromPasteboardCarrier()
+            self?.rebuildFilledSlotChoices()
+            self?.statusBanner?.text = "Slots updated"
         }
     }
 }

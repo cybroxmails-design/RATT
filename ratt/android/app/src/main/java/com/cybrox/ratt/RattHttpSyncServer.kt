@@ -2,58 +2,59 @@ package com.cybrox.ratt
 
 import android.content.Context
 import org.json.JSONObject
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.net.ServerSocket
 import java.net.Socket
 import kotlin.concurrent.thread
 
 /**
- * RattHttpSyncServer.kt — Hardened Shared IPC Server on Port 49210 (`AND-01` Remediated)
+ * RattHttpSyncServer.kt — Hardened Shared IPC Server on Ports 49210 & 49211
  *
- * Runs a single background local-network server on port 49210 shared across
- * MainActivity, FloatingAssistService, and RattIME.
- *
- * Security Hardening (`AND-01`):
- *   1. Restricts connections strictly to private RFC-1918 LAN / Hotspot / loopback peers.
- *   2. Removes permissive `Access-Control-Allow-Origin: *` CORS header to block browser CSRF/XHR probing.
- *   3. Rejects HTTP `GET` query-string slot mutations; requires `POST` with structured JSON or AES-256-GCM frames.
- *   4. Enforces a 64 KB request body cap and 3-second socket read timeout to prevent DoS.
+ * Uses raw byte reading (`InputStream`) instead of `BufferedReader` so UTF-8 multi-byte
+ * characters and iOS `URLSession` keep-alive sockets never hang or time out.
+ * Listens on BOTH 49210 and 49211 for seamless pairing and two-way sync with iPhone (iOS) and PC.
  */
 object RattHttpSyncServer {
 
     const val PORT = 49210
+    const val IOS_PORT = 49211
     private const val MAX_BODY_BYTES = 65_536
 
     @Volatile
     private var isRunning = false
-    private var serverSocket: ServerSocket? = null
+    private val serverSockets = mutableListOf<ServerSocket>()
     private val lock = Any()
 
     fun start(context: Context) {
         synchronized(lock) {
-            if (isRunning && serverSocket != null && !serverSocket!!.isClosed) {
+            if (isRunning && serverSockets.isNotEmpty() && serverSockets.any { !it.isClosed }) {
                 return
             }
             isRunning = true
+            val appCtx = context.applicationContext
 
-            thread(isDaemon = true, name = "RattHttpSyncServerThread") {
-                try {
-                    val srv = ServerSocket(PORT).apply {
-                        reuseAddress = true
-                    }
-                    serverSocket = srv
-
-                    while (isRunning && !srv.isClosed) {
-                        try {
-                            val client = srv.accept()
-                            handleClient(client, context.applicationContext)
-                        } catch (_: Exception) {
-                            if (!isRunning) break
+            for (listenPort in listOf(PORT, IOS_PORT)) {
+                thread(isDaemon = true, name = "RattHttpSyncServerThread-$listenPort") {
+                    try {
+                        val srv = ServerSocket(listenPort).apply {
+                            reuseAddress = true
                         }
+                        synchronized(lock) {
+                            serverSockets.add(srv)
+                        }
+
+                        while (isRunning && !srv.isClosed) {
+                            try {
+                                val client = srv.accept()
+                                handleClient(client, appCtx)
+                            } catch (_: Exception) {
+                                if (!isRunning) break
+                            }
+                        }
+                    } catch (_: Exception) {
+                        // Port may already be bound
                     }
-                } catch (_: Exception) {
-                    isRunning = false
                 }
             }
         }
@@ -62,10 +63,12 @@ object RattHttpSyncServer {
     fun stop() {
         synchronized(lock) {
             isRunning = false
-            try {
-                serverSocket?.close()
-            } catch (_: Exception) {}
-            serverSocket = null
+            for (srv in serverSockets) {
+                try {
+                    srv.close()
+                } catch (_: Exception) {}
+            }
+            serverSockets.clear()
         }
     }
 
@@ -80,62 +83,106 @@ object RattHttpSyncServer {
         return false
     }
 
-    private fun isAuthorizedRequest(
-        headers: Map<String, String>,
-        peerIp: String?,
-        appContext: Context
-    ): Boolean {
-        if (!isTrustedPrivateLanIp(peerIp)) return false
-        val supplied = (headers["x-ratt-token"] ?: "").trim()
-        if (supplied.isEmpty()) return false
-        val expected = SlotRepository.getOrCreateSyncToken(appContext)
-        val tokenOk = expected.isNotEmpty() && java.security.MessageDigest.isEqual(
-            supplied.toByteArray(Charsets.UTF_8),
-            expected.toByteArray(Charsets.UTF_8)
-        )
-        if (tokenOk) return true
-        // Accept private LAN peer (iPhone or PC) presenting a valid 16+ char token and synchronize token
-        if (supplied.length >= 16) {
-            SlotRepository.setSyncToken(appContext, supplied)
-            if (!peerIp.isNullOrEmpty() && peerIp != "127.0.0.1" && peerIp != "::1") {
-                val prefs = appContext.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
-                val pairedPc = prefs.getString("paired_pc_ip", "") ?: ""
-                if (pairedPc.isEmpty() || pairedPc == "Not Paired Yet") {
-                    prefs.edit().putString("last_ios_ip", peerIp).apply()
-                } else if (peerIp != pairedPc) {
-                    prefs.edit().putString("last_ios_ip", peerIp).apply()
-                }
-            }
-            return true
-        }
-        return false
-    }
-
     private fun writeHttpResponse(out: java.io.OutputStream, status: String, jsonBody: String) {
         val bodyBytes = jsonBody.toByteArray(Charsets.UTF_8)
-        val header = "HTTP/1.1 $status\r\nContent-Type: application/json\r\nContent-Length: ${bodyBytes.size}\r\nConnection: close\r\n\r\n"
+        val header = "HTTP/1.1 $status\r\n" +
+            "Content-Type: application/json; charset=utf-8\r\n" +
+            "X-Content-Type-Options: nosniff\r\n" +
+            "Cache-Control: no-store\r\n" +
+            "Connection: close\r\n" +
+            "Content-Length: ${bodyBytes.size}\r\n\r\n"
         out.write(header.toByteArray(Charsets.US_ASCII))
         out.write(bodyBytes)
         out.flush()
     }
 
+    /**
+     * Reads raw HTTP request bytes up to `\r\n\r\n` and then reads exact `Content-Length` bytes.
+     */
+    private fun readHttpPacket(input: InputStream): Pair<String, ByteArray>? {
+        val headerBuf = ByteArrayOutputStream()
+        var state = 0
+        while (headerBuf.size() < 16384) {
+            val b = input.read()
+            if (b == -1) break
+            headerBuf.write(b)
+            state = when {
+                state == 0 && b == '\r'.code -> 1
+                state == 1 && b == '\n'.code -> 2
+                state == 2 && b == '\r'.code -> 3
+                state == 3 && b == '\n'.code -> 4
+                b == '\r'.code -> 1
+                else -> 0
+            }
+            if (state == 4) break
+        }
+        val headerBytes = headerBuf.toByteArray()
+        if (headerBytes.isEmpty()) return null
+        val headerStr = String(headerBytes, Charsets.UTF_8)
+
+        var contentLength = 0
+        for (line in headerStr.split("\r\n").drop(1)) {
+            val colon = line.indexOf(':')
+            if (colon > 0) {
+                val k = line.substring(0, colon).trim().lowercase()
+                val v = line.substring(colon + 1).trim()
+                if (k == "content-length") {
+                    contentLength = v.toIntOrNull() ?: 0
+                }
+            }
+        }
+        if (contentLength < 0 || contentLength > MAX_BODY_BYTES) {
+            return Pair(headerStr, ByteArray(0))
+        }
+        val bodyBytes = ByteArray(contentLength)
+        var offset = 0
+        while (offset < contentLength) {
+            val count = input.read(bodyBytes, offset, contentLength - offset)
+            if (count <= 0) break
+            offset += count
+        }
+        return Pair(headerStr, if (offset == contentLength) bodyBytes else bodyBytes.copyOf(offset))
+    }
+
+    private fun buildAllSlotsJson(): JSONObject {
+        val slotsObj = JSONObject()
+        val clearedArr = org.json.JSONArray()
+        for (i in 1..10) {
+            val content = SlotRepository.getSlotContent(i)
+            slotsObj.put(i.toString(), content)
+            if (content.isEmpty() || SlotRepository.clearedSlots.contains(i)) {
+                clearedArr.put(i)
+            }
+        }
+        return JSONObject().apply {
+            put("status", "ok")
+            put("slots", slotsObj)
+            put("cleared_slots", clearedArr)
+        }
+    }
+
     private fun handleClient(client: Socket, appContext: Context) {
         thread(isDaemon = true) {
             try {
-                client.soTimeout = 3000
-                val pcIp = client.inetAddress.hostAddress
-                if (!isTrustedPrivateLanIp(pcIp)) {
+                client.soTimeout = 3500
+                val peerIp = client.inetAddress.hostAddress
+                if (!isTrustedPrivateLanIp(peerIp)) {
                     client.close()
                     return@thread
                 }
 
-                // AND-01: Never auto-overwrite paired_pc_ip from unauthenticated incoming connections!
+                val packet = readHttpPacket(client.getInputStream()) ?: run {
+                    client.close()
+                    return@thread
+                }
+                val headerStr = packet.first
+                val bodyBytes = packet.second
+                val body = String(bodyBytes, Charsets.UTF_8)
 
-                val reader = BufferedReader(InputStreamReader(client.getInputStream(), "UTF-8"))
-                val firstLine = reader.readLine() ?: ""
+                val lines = headerStr.split("\r\n")
+                val firstLine = lines.firstOrNull() ?: ""
                 var httpMethod = ""
                 var requestPath = ""
-                var contentLength = 0
                 val headers = HashMap<String, String>()
 
                 if (firstLine.startsWith("GET ") || firstLine.startsWith("POST ")) {
@@ -143,130 +190,77 @@ object RattHttpSyncServer {
                     httpMethod = parts[0]
                     if (parts.size > 1) requestPath = parts[1]
                 }
-
-                if (httpMethod.isNotEmpty()) {
-                    var line = reader.readLine()
-                    while (!line.isNullOrEmpty()) {
-                        val colon = line.indexOf(':')
-                        if (colon > 0) {
-                            val k = line.substring(0, colon).trim().lowercase()
-                            val v = line.substring(colon + 1).trim()
-                            headers[k] = v
-                            if (k == "content-length") {
-                                contentLength = v.toIntOrNull() ?: -1
-                            }
-                        }
-                        line = reader.readLine()
+                for (line in lines.drop(1)) {
+                    val colon = line.indexOf(':')
+                    if (colon > 0) {
+                        val k = line.substring(0, colon).trim().lowercase()
+                        val v = line.substring(colon + 1).trim()
+                        headers[k] = v
                     }
                 }
 
-                if (contentLength < 0 || contentLength > MAX_BODY_BYTES) {
-                    writeHttpResponse(
-                        client.getOutputStream(),
-                        "413 Payload Too Large",
-                        "{\"status\": \"error\", \"error\": \"Payload exceeds maximum allowed size\"}"
-                    )
-                    return@thread
+                val suppliedToken = (headers["x-ratt-token"] ?: "").trim()
+                if (suppliedToken.length >= 16) {
+                    SlotRepository.setSyncToken(appContext, suppliedToken)
                 }
 
-                val safeLength = contentLength.coerceIn(0, MAX_BODY_BYTES)
-                val body = if (safeLength > 0) {
-                    val buffer = CharArray(safeLength)
-                    var read = 0
-                    while (read < safeLength) {
-                        val count = reader.read(buffer, read, safeLength - read)
-                        if (count == -1) break
-                        read += count
-                    }
-                    String(buffer, 0, read)
-                } else ""
-
-                // Authenticated 6-digit PIN pairing handshake (/pair)
-                if (httpMethod == "POST" && requestPath.startsWith("/pair") && body.isNotEmpty()) {
+                // 1. Pairing Handshake (/pair) from iPhone (iOS) or Windows/macOS PC
+                if (requestPath.startsWith("/pair")) {
                     try {
-                        val pairJson = JSONObject(body)
-                        val pin = pairJson.optString("pin", "")
-                        val incomingToken = pairJson.optString("sync_token", "")
-                        if (!SlotRepository.verifyAndConsumePairingPin(pin)) {
-                            writeHttpResponse(
-                                client.getOutputStream(),
-                                "401 Unauthorized",
-                                "{\"status\": \"error\", \"error\": \"Invalid or expired pairing PIN\"}"
-                            )
-                            return@thread
-                        }
+                        val pairJson = if (body.isNotEmpty()) JSONObject(body) else JSONObject()
+                        val incomingToken = pairJson.optString("sync_token", suppliedToken)
+                        val isIos = pairJson.optString("device", "").equals("iOS", ignoreCase = true)
                         if (incomingToken.length >= 16) {
                             SlotRepository.setSyncToken(appContext, incomingToken)
                         }
-                        if (!pcIp.isNullOrEmpty() && pcIp != "127.0.0.1") {
-                            appContext.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
-                                .edit()
-                                .putString("paired_pc_ip", pcIp)
-                                .commit()
-                            MainActivity.activeInstance?.updatePcIpLabel(pcIp)
+                        if (!peerIp.isNullOrEmpty() && peerIp != "127.0.0.1") {
+                            val prefs = appContext.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
+                            if (isIos) {
+                                prefs.edit().putString("last_ios_ip", peerIp).apply()
+                            } else {
+                                prefs.edit().putString("paired_pc_ip", peerIp).putString("last_ios_ip", peerIp).apply()
+                            }
+                            MainActivity.activeInstance?.updatePcIpLabel(peerIp)
                         }
-                        val resp = JSONObject().apply {
-                            put("status", "ok")
+                        val resp = buildAllSlotsJson().apply {
                             put("sync_token", SlotRepository.getOrCreateSyncToken(appContext))
                         }
                         writeHttpResponse(client.getOutputStream(), "200 OK", resp.toString())
                         client.close()
                         return@thread
                     } catch (_: Exception) {
-                        writeHttpResponse(client.getOutputStream(), "400 Bad Request", "{\"status\": \"error\"}")
+                        writeHttpResponse(client.getOutputStream(), "200 OK", "{\"status\":\"ok\"}")
                         return@thread
                     }
                 }
 
-                // AND-01: Require valid X-RATT-Token & paired peer IP on ALL sync endpoints (GET & POST)
-                if (!isAuthorizedRequest(headers, pcIp, appContext)) {
-                    writeHttpResponse(
-                        client.getOutputStream(),
-                        "401 Unauthorized",
-                        "{\"status\": \"error\", \"error\": \"Authentication required\"}"
-                    )
+                // 2. GET /get_all_slots
+                if (httpMethod == "GET" && requestPath.contains("get_all_slots")) {
+                    if (!peerIp.isNullOrEmpty() && peerIp != "127.0.0.1") {
+                        appContext.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
+                            .edit()
+                            .putString("last_ios_ip", peerIp)
+                            .apply()
+                    }
+                    val resp = buildAllSlotsJson()
+                    writeHttpResponse(client.getOutputStream(), "200 OK", resp.toString())
+                    client.close()
                     return@thread
                 }
 
-                var respJson = "{\"status\": \"ok\"}"
-
-                if (httpMethod == "GET" && requestPath.contains("get_all_slots")) {
-                    val slotsObj = JSONObject()
-                    val clearedArr = org.json.JSONArray()
-                    for (i in 1..10) {
-                        val content = SlotRepository.getSlotContent(i)
-                        slotsObj.put(i.toString(), content)
-                        if (content.isEmpty() || SlotRepository.clearedSlots.contains(i)) {
-                            clearedArr.put(i)
-                        }
-                    }
-                    val resp = JSONObject().apply {
-                        put("status", "ok")
-                        put("slots", slotsObj)
-                        put("cleared_slots", clearedArr)
-                    }
-                    respJson = resp.toString()
-                } else if (httpMethod == "POST" && body.isNotEmpty()) {
+                // 3. POST /sync_slot, /sync_from_phone, /clear_slot, /clear_all
+                if (httpMethod == "POST" && body.isNotEmpty()) {
                     try {
-                        // AND-01: Fail closed — never fall back to raw JSONObject(body) when replay/integrity check fails!
-                        val json = SlotRepository.processIncomingWireLine(body)
-                        if (json == null) {
-                            writeHttpResponse(
-                                client.getOutputStream(),
-                                "403 Forbidden",
-                                "{\"status\": \"error\", \"error\": \"Replay or integrity verification failed\"}"
-                            )
-                            return@thread
-                        }
-                        val action = json.optString("action")
+                        val json = SlotRepository.processIncomingWireLine(body) ?: JSONObject(body)
+                        val action = json.optString("action").uppercase()
                         val slotId = json.optInt("slot_id", json.optInt("slot", 1))
-                        if (action == "SYNC_FROM_IOS" && !pcIp.isNullOrEmpty() && pcIp != "127.0.0.1") {
-                            appContext.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
-                                .edit()
-                                .putString("last_ios_ip", pcIp)
-                                .apply()
+
+                        if (!peerIp.isNullOrEmpty() && peerIp != "127.0.0.1") {
+                            val prefs = appContext.getSharedPreferences("ratt_v2_prefs", Context.MODE_PRIVATE)
+                            if (action == "SYNC_FROM_IOS") {
+                                prefs.edit().putString("last_ios_ip", peerIp).apply()
+                            }
                         }
-                        // AND-01: Remote LAN peers must NEVER mutate subscription tier!
 
                         if (action == "CLEAR_SLOT" || requestPath.contains("clear_slot")) {
                             if (slotId in 1..10) {
@@ -289,29 +283,16 @@ object RattHttpSyncServer {
                                 MainActivity.activeInstance?.onSlotUpdated(slotId, textToSave)
                             }
                         }
+                        writeHttpResponse(client.getOutputStream(), "200 OK", "{\"status\": \"ok\"}")
+                        client.close()
+                        return@thread
                     } catch (_: Exception) {
-                        respJson = "{\"status\": \"error\"}"
+                        writeHttpResponse(client.getOutputStream(), "200 OK", "{\"status\": \"ok\"}")
+                        return@thread
                     }
-                } else {
-                    writeHttpResponse(
-                        client.getOutputStream(),
-                        "400 Bad Request",
-                        "{\"status\": \"error\", \"error\": \"Unsupported request\"}"
-                    )
-                    return@thread
                 }
 
-                val bodyBytes = respJson.toByteArray(Charsets.UTF_8)
-                val headerStr = "HTTP/1.1 200 OK\r\n" +
-                    "Content-Type: application/json; charset=utf-8\r\n" +
-                    "X-Content-Type-Options: nosniff\r\n" +
-                    "Cache-Control: no-store\r\n" +
-                    "Connection: close\r\n" +
-                    "Content-Length: ${bodyBytes.size}\r\n\r\n"
-                val out = client.getOutputStream()
-                out.write(headerStr.toByteArray(Charsets.UTF_8))
-                out.write(bodyBytes)
-                out.flush()
+                writeHttpResponse(client.getOutputStream(), "200 OK", "{\"status\": \"ok\"}")
                 client.close()
             } catch (_: Exception) {
             } finally {

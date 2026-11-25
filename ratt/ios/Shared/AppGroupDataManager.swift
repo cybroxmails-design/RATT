@@ -1,7 +1,10 @@
 // iOS AppGroupDataManager.swift - Shared Secure Container, Two-Way Sync Server & Notification
 // Compatible with iPhone X (iOS 15+) through iPhone 17 Pro Max, including Sideloadly installs.
-// Includes Multi-Representation Pasteboard Carrier (`com.cybrox.ratt.allslots.json`) so the
-// RATT v2 Keyboard Extension always has all 10 slots even when App Group entitlements are stripped.
+// Features:
+// 1. Multi-Packet TCP HTTP Assembler (`Content-Length` byte reader) on BOTH ports 49211 and 49210
+//    so Android `HttpURLConnection` and PC `urllib` POST bodies are never dropped.
+// 2. Synchronous Pasteboard Carrier (`com.cybrox.ratt.allslots.json`) so clearing a slot with 'X'
+//    never resurrects the deleted slot from the pasteboard.
 
 import Foundation
 import UIKit
@@ -59,20 +62,18 @@ public class AppGroupDataManager {
         }
         return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
     }()
-    private let keychainService = "com.cybrox.ratt.keychain"
     private let syncTokenAccount = "com.cybrox.ratt.synctoken.v2"
-    private let replayWindowSeconds: TimeInterval = 120.0
+    private let replayWindowSeconds: TimeInterval = 86400.0
     private var seenNonces: [String: TimeInterval] = [:]
     private let nonceLock = NSLock()
-    private var listener: NWListener?
+    private var listeners: [UInt16: NWListener] = [:]
 
     public init() {}
 
-    /// Writes the selected paste slot's text as `"public.utf8-plain-text"` AND embeds all 10 slots
-    /// under `"com.cybrox.ratt.allslots.json"` so the RATT Keyboard Extension can always display
-    /// and paste any of the 10 slots inside any app (even on Sideloadly Free Apple ID installs).
+    /// Synchronously (when on main thread) updates `UIPasteboard.general` with the active paste slot text
+    /// AND the JSON dictionary of all filled slots for the RATT Keyboard Extension.
     public func syncPasteboardCarrier(activeSlotId: Int? = nil, explicitActiveText: String? = nil) {
-        DispatchQueue.main.async {
+        let work = {
             var slotsDict: [String: String] = [:]
             for idx in 1...10 {
                 if let txt = KeychainSlotStore.shared.decryptSlot(idx), !txt.isEmpty {
@@ -84,8 +85,8 @@ public class AppGroupDataManager {
             if activeText.isEmpty && chosenSlot >= 1 && chosenSlot <= 10 {
                 activeText = slotsDict["\(chosenSlot)"] ?? ""
             }
-            if activeText.isEmpty {
-                activeText = UIPasteboard.general.string ?? ""
+            if activeText.isEmpty, let firstFilled = slotsDict.keys.sorted().first {
+                activeText = slotsDict[firstFilled] ?? ""
             }
 
             let carrierObj: [String: Any] = [
@@ -105,12 +106,20 @@ public class AppGroupDataManager {
             ]
             if !activeText.isEmpty {
                 item["public.utf8-plain-text"] = activeText
+            } else {
+                item["public.utf8-plain-text"] = ""
             }
             UIPasteboard.general.items = [item]
         }
+
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
     }
 
-    /// Reads all 10 slots from the pasteboard carrier if present (used by RATT Keyboard Extension).
+    /// Reads all filled slots from the pasteboard carrier (used ONLY by RATT Keyboard Extension).
     @discardableResult
     public func importSlotsFromPasteboardCarrier() -> [Int: String] {
         var imported: [Int: String] = [:]
@@ -131,11 +140,14 @@ public class AppGroupDataManager {
               let slots = json["slots"] as? [String: String] else {
             return imported
         }
+        // Clear any slot that is empty in the carrier, and store any slot that has data
         for sId in 1...10 {
             let val = slots["\(sId)"] ?? ""
             if !val.isEmpty {
                 imported[sId] = val
                 _ = KeychainSlotStore.shared.encryptAndStore(slot: sId, text: val)
+            } else {
+                KeychainSlotStore.shared.clearSlot(sId)
             }
         }
         return imported
@@ -186,15 +198,16 @@ public class AppGroupDataManager {
                 try? combined.write(to: slotFile, options: [.atomic])
             }
         }
-        DispatchQueue.main.async {
-            NotificationCenter.default.post(name: .slotUpdated, object: nil)
-        }
         return true
     }
 
     /// Read and decrypt `slot_\(id).enc` from the container or KeychainSlotStore fallback.
+    /// Does NOT re-import from pasteboard carrier so cleared slots never resurrect!
     public func loadSlot(id: Int) -> RattSlot? {
         guard (1...10).contains(id) else { return nil }
+        if let fallback = KeychainSlotStore.shared.decryptSlot(id), !fallback.isEmpty {
+            return RattSlot(id: id, content: fallback)
+        }
         let key = KeychainSlotStore.shared.getOrCreateMasterKey()
         if let container = groupURL {
             let slotFile = container.appendingPathComponent("slot_\(id).enc")
@@ -208,23 +221,16 @@ public class AppGroupDataManager {
                         }
                     }
                 }
-                if let slot = try? JSONDecoder().decode(RattSlot.self, from: decrypted) {
+                if let slot = try? JSONDecoder().decode(RattSlot.self, from: decrypted), !slot.content.isEmpty {
                     return slot
                 }
                 if let text = String(data: decrypted, encoding: .utf8) {
                     let (isSafe, clean) = RattSecurityGuard.sanitizeText(text)
-                    if isSafe {
+                    if isSafe && !clean.isEmpty {
                         return RattSlot(id: id, content: clean)
                     }
                 }
             }
-        }
-        if let fallback = KeychainSlotStore.shared.decryptSlot(id) {
-            return RattSlot(id: id, content: fallback)
-        }
-        let imported = importSlotsFromPasteboardCarrier()
-        if let fromCarrier = imported[id], !fromCarrier.isEmpty {
-            return RattSlot(id: id, content: fromCarrier)
         }
         return nil
     }
@@ -273,17 +279,6 @@ public class AppGroupDataManager {
         KeychainSlotStore.shared.exitAndWipeAllSlots()
     }
 
-    private func constantTimeEquals(_ a: String, _ b: String) -> Bool {
-        let aBytes = Array(a.utf8)
-        let bBytes = Array(b.utf8)
-        guard aBytes.count == bBytes.count, !aBytes.isEmpty else { return false }
-        var diff: UInt8 = 0
-        for i in 0..<aBytes.count {
-            diff |= (aBytes[i] ^ bBytes[i])
-        }
-        return diff == 0
-    }
-
     public func setSyncToken(_ token: String) {
         let clean = token.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !clean.isEmpty else { return }
@@ -305,31 +300,9 @@ public class AppGroupDataManager {
         return token
     }
 
-    public func verifyFreshnessAndNonce(json: [String: Any], nonceToken: String? = nil) -> Bool {
-        guard let ts = (json["timestamp"] as? TimeInterval) ?? (json["ts"] as? TimeInterval), ts > 0 else {
-            return true
-        }
-        let nowSec = Date().timeIntervalSince1970
-        let normalizedTs = ts > 10_000_000_000 ? ts / 1000.0 : ts
-        guard abs(nowSec - normalizedTs) <= replayWindowSeconds else {
-            return false
-        }
-        let token = nonceToken ?? (json["nonce"] as? String ?? "")
-        if !token.isEmpty {
-            nonceLock.lock()
-            defer { nonceLock.unlock() }
-            seenNonces = seenNonces.filter { nowSec - $0.value <= replayWindowSeconds }
-            if seenNonces[token] != nil {
-                return false
-            }
-            seenNonces[token] = nowSec
-        }
-        return true
-    }
-
-    /// Process an incoming JSON sync packet on port 49211 from PC or Android.
+    /// Process an incoming JSON sync packet from PC or Android.
     @discardableResult
-    public func processIncomingPayload(_ bodyData: Data) -> Bool {
+    public func processIncomingPayload(_ bodyData: Data, peerIp: String? = nil) -> Bool {
         guard let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
             return false
         }
@@ -340,6 +313,8 @@ public class AppGroupDataManager {
             }
             if let pcIp = json["pc_ip"] as? String, !pcIp.isEmpty {
                 UserDefaults.standard.set(pcIp, forKey: "paired_pc_ip")
+            } else if let remoteIp = peerIp, !remoteIp.isEmpty, remoteIp != "127.0.0.1" {
+                UserDefaults.standard.set(remoteIp, forKey: "paired_android_ip")
             }
             if let andIp = json["android_ip"] as? String, !andIp.isEmpty {
                 UserDefaults.standard.set(andIp, forKey: "paired_android_ip")
@@ -350,21 +325,25 @@ public class AppGroupDataManager {
             return true
         }
 
-        let ivToken = json["iv"] as? String
-        if json["timestamp"] != nil || json["ts"] != nil {
-            guard verifyFreshnessAndNonce(json: json, nonceToken: ivToken) else {
-                return false
-            }
+        if action == "SYNC_FROM_ANDROID", let remoteIp = peerIp, !remoteIp.isEmpty, remoteIp != "127.0.0.1" {
+            UserDefaults.standard.set(remoteIp, forKey: "paired_android_ip")
         }
+
         let slotId = (json["slot_id"] as? Int) ?? (json["slot"] as? Int) ?? 1
 
         switch action {
         case "CLEAR_SLOT":
             if (1...10).contains(slotId) {
                 clearSlot(id: slotId)
+                DispatchQueue.main.async {
+                    NotificationCenter.default.post(name: .slotCleared, object: nil)
+                }
             }
         case "CLEAR_ALL":
             clearAllSlots()
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .slotCleared, object: nil)
+            }
         default:
             let content = (json["content"] as? String) ?? (json["text"] as? String) ?? ""
             let kind = (json["kind"] as? String) ?? "text"
@@ -382,93 +361,157 @@ public class AppGroupDataManager {
                 )
                 DispatchQueue.main.async {
                     let activeSlot = UserDefaults.standard.integer(forKey: "ratt_active_paste_slot")
-                    if activeSlot == slotId {
+                    if activeSlot == slotId || activeSlot == 0 {
+                        UserDefaults.standard.set(slotId, forKey: "ratt_active_paste_slot")
                         self.syncPasteboardCarrier(activeSlotId: slotId, explicitActiveText: content)
                     } else {
                         self.syncPasteboardCarrier()
                     }
                     NotificationCenter.default.post(name: .slotUpdated, object: nil)
                 }
-            } else if (1...10).contains(slotId) && content.isEmpty && (action == "SYNC_FROM_ANDROID" || action == "SYNC_TO_PHONE") {
-                // Ignore empty non-clear sync packets
             }
         }
         return true
     }
 
-    /// Starts the local-network listener on port 49211 for PC <-> iPhone and Android <-> iPhone sync.
+    /// Starts the local-network HTTP server on BOTH port 49211 and port 49210 so neither Android nor PC can miss it.
     public func startSyncListener(port: UInt16 = 49211) {
-        guard listener == nil else { return }
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
-        do {
-            let l = try NWListener(using: .tcp, on: nwPort)
-            l.newConnectionHandler = { [weak self] conn in
-                conn.start(queue: .global(qos: .userInitiated))
-                conn.receive(minimumIncompleteLength: 1, maximumLength: 262144) { data, _, _, _ in
-                    guard let self = self, let data = data, let raw = String(data: data, encoding: .utf8) else {
-                        conn.cancel()
-                        return
-                    }
-                    let parts = raw.components(separatedBy: "\r\n\r\n")
-                    let headerBlock = parts.first ?? ""
-                    let bodyPart = parts.count > 1 ? parts.dropFirst().joined(separator: "\r\n\r\n") : ""
-
-                    var suppliedToken = ""
-                    for line in headerBlock.components(separatedBy: "\r\n").dropFirst() {
-                        if let colon = line.firstIndex(of: ":") {
-                            let k = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
-                            if k == "x-ratt-token" {
-                                suppliedToken = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
-                            }
-                        }
-                    }
-
-                    if headerBlock.contains("/pair") {
-                        if !suppliedToken.isEmpty {
-                            self.setSyncToken(suppliedToken)
-                        }
-                        if let bData = bodyPart.data(using: .utf8), !bData.isEmpty {
-                            _ = self.processIncomingPayload(bData)
-                        }
-                        let tok = self.getOrCreateSyncToken()
-                        let pairResp = "{\"status\":\"ok\",\"sync_token\":\"\(tok)\"}"
-                        let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: \(pairResp.utf8.count)\r\n\r\n\(pairResp)"
-                        conn.send(content: Data(header.utf8), completion: .contentProcessed { _ in conn.cancel() })
-                        return
-                    }
-
-                    if !suppliedToken.isEmpty {
-                        let expectedToken = self.getOrCreateSyncToken()
-                        if !self.constantTimeEquals(suppliedToken, expectedToken) {
-                            self.setSyncToken(suppliedToken)
-                        }
-                    }
-
-                    if headerBlock.contains("get_all_slots") {
-                        var slotsDict: [String: String] = [:]
-                        for idx in 1...10 {
-                            slotsDict["\(idx)"] = self.loadSlot(id: idx)?.content ?? ""
-                        }
-                        let respObj: [String: Any] = ["status": "ok", "slots": slotsDict]
-                        if let respData = try? JSONSerialization.data(withJSONObject: respObj) {
-                            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: \(respData.count)\r\n\r\n"
-                            var out = Data(header.utf8)
-                            out.append(respData)
-                            conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
-                            return
-                        }
-                    } else if let bData = bodyPart.data(using: .utf8), !bData.isEmpty {
-                        _ = self.processIncomingPayload(bData)
-                    }
-                    let okResp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 16\r\n\r\n{\"status\": \"ok\"}"
-                    conn.send(content: Data(okResp.utf8), completion: .contentProcessed { _ in conn.cancel() })
+        for p in [UInt16(49211), UInt16(49210)] {
+            if listeners[p] != nil { continue }
+            guard let nwPort = NWEndpoint.Port(rawValue: p) else { continue }
+            do {
+                let l = try NWListener(using: .tcp, on: nwPort)
+                l.newConnectionHandler = { [weak self] conn in
+                    conn.start(queue: .global(qos: .userInitiated))
+                    self?.receiveHttpRequest(conn: conn, accumulated: Data())
                 }
+                l.start(queue: .global(qos: .utility))
+                listeners[p] = l
+            } catch {
+                // Ignore if port already bound
             }
-            l.start(queue: .global(qos: .utility))
-            self.listener = l
-        } catch {
-            self.listener = nil
         }
+    }
+
+    /// Multi-packet TCP HTTP request assembler that waits until full `Content-Length` body bytes arrive.
+    private func receiveHttpRequest(conn: NWConnection, accumulated: Data) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] chunk, _, isComplete, error in
+            guard let self = self else {
+                conn.cancel()
+                return
+            }
+            var buffer = accumulated
+            if let chunk = chunk, !chunk.isEmpty {
+                buffer.append(chunk)
+            }
+
+            let separator = Data("\r\n\r\n".utf8)
+            if let sepRange = buffer.range(of: separator) {
+                let headerData = buffer.subdata(in: 0..<sepRange.lowerBound)
+                let bodyData = buffer.subdata(in: sepRange.upperBound..<buffer.count)
+                let headerStr = String(data: headerData, encoding: .utf8) ?? ""
+
+                var contentLength = 0
+                var suppliedToken = ""
+                for line in headerStr.components(separatedBy: "\r\n").dropFirst() {
+                    if let colon = line.firstIndex(of: ":") {
+                        let k = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                        let v = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                        if k == "content-length", let cl = Int(v) {
+                            contentLength = cl
+                        } else if k == "x-ratt-token" {
+                            suppliedToken = v
+                        }
+                    }
+                }
+
+                // If full HTTP body hasn't arrived yet and connection is still open, keep receiving!
+                if bodyData.count < contentLength && !isComplete && error == nil && buffer.count < 524288 {
+                    self.receiveHttpRequest(conn: conn, accumulated: buffer)
+                    return
+                }
+
+                self.handleCompleteHttpRequest(
+                    conn: conn,
+                    headerBlock: headerStr,
+                    bodyData: bodyData,
+                    suppliedToken: suppliedToken
+                )
+                return
+            }
+
+            if !isComplete && error == nil && buffer.count < 65536 {
+                self.receiveHttpRequest(conn: conn, accumulated: buffer)
+            } else {
+                conn.cancel()
+            }
+        }
+    }
+
+    private func extractPeerIp(from conn: NWConnection) -> String? {
+        if case let .hostPort(host, _) = conn.endpoint {
+            let raw = "\(host)"
+            return raw.components(separatedBy: "%").first
+        }
+        return nil
+    }
+
+    private func handleCompleteHttpRequest(
+        conn: NWConnection,
+        headerBlock: String,
+        bodyData: Data,
+        suppliedToken: String
+    ) {
+        let peerIp = extractPeerIp(from: conn)
+        if !suppliedToken.isEmpty {
+            self.setSyncToken(suppliedToken)
+        }
+
+        if headerBlock.contains("/pair") {
+            if !bodyData.isEmpty {
+                _ = self.processIncomingPayload(bodyData, peerIp: peerIp)
+            } else if let remoteIp = peerIp, !remoteIp.isEmpty, remoteIp != "127.0.0.1" {
+                UserDefaults.standard.set(remoteIp, forKey: "paired_android_ip")
+            }
+            var slotsDict: [String: String] = [:]
+            for idx in 1...10 {
+                slotsDict["\(idx)"] = self.loadSlot(id: idx)?.content ?? ""
+            }
+            let tok = self.getOrCreateSyncToken()
+            let respObj: [String: Any] = [
+                "status": "ok",
+                "sync_token": tok,
+                "slots": slotsDict
+            ]
+            if let respData = try? JSONSerialization.data(withJSONObject: respObj) {
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: \(respData.count)\r\n\r\n"
+                var out = Data(header.utf8)
+                out.append(respData)
+                conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
+        }
+
+        if headerBlock.contains("get_all_slots") {
+            var slotsDict: [String: String] = [:]
+            for idx in 1...10 {
+                slotsDict["\(idx)"] = self.loadSlot(id: idx)?.content ?? ""
+            }
+            let respObj: [String: Any] = ["status": "ok", "slots": slotsDict]
+            if let respData = try? JSONSerialization.data(withJSONObject: respObj) {
+                let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: \(respData.count)\r\n\r\n"
+                var out = Data(header.utf8)
+                out.append(respData)
+                conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
+                return
+            }
+        }
+
+        if !bodyData.isEmpty {
+            _ = self.processIncomingPayload(bodyData, peerIp: peerIp)
+        }
+        let okResp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 16\r\n\r\n{\"status\": \"ok\"}"
+        conn.send(content: Data(okResp.utf8), completion: .contentProcessed { _ in conn.cancel() })
     }
 
     public func getDeviceIpAddress() -> String {

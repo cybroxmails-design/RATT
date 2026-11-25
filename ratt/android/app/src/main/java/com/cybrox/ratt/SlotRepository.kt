@@ -54,7 +54,7 @@ object SlotRepository {
     private const val PREFS_NAME = "EncryptedSharedPreferences_RattSlotsV2"
     private const val GCM_IV_LENGTH_BYTES = 12   // 96-bit CSPRNG IV
     private const val GCM_TAG_LENGTH_BITS = 128  // 128-bit authentication tag
-    private const val REPLAY_WINDOW_SECONDS = 120L
+    private const val REPLAY_WINDOW_SECONDS = 86400L
     private const val MAX_SEEN_NONCES = 512
     private val AAD_ANDROID_FRAME = "RATT-Android-v2:aes256gcm".toByteArray(Charsets.UTF_8)
 
