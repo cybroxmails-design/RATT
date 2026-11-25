@@ -1,10 +1,10 @@
-// ContentView.swift — RATT v2 for iOS Container App (iPhone X through iPhone 17 Pro Max)
-// Fixes:
-// 1. Red 'X' button immediately clears the slot and never resurrects from pasteboard carrier.
-// 2. Clicking "📋 Paste from RATT" displays all slots that contain data AT THE EXACT SAME PLACE
-//    so the user can choose which slot to paste from in one tap.
-// 3. Direct Two-Way Pairing & Synchronization with RATT Android (ports 49210 / 49211) and RATT PC.
-// 4. Touch anywhere outside text fields to minimize keyboard.
+// ContentView.swift — RATT v2 for iOS (iPhone X through iPhone 17 Pro Max)
+// Simple, zero-setup user experience:
+// - When the user clicks "📋 Paste from Slot", the slots that contain data are displayed
+//   right on top of the keyboard in a transparent black background for the user to choose from.
+// - Red 'X' button immediately clears any slot.
+// - Touch anywhere to minimize the keyboard.
+// - Direct Two-Way Wi-Fi Sync with RATT Android and RATT PC.
 
 import SwiftUI
 import UIKit
@@ -53,17 +53,15 @@ public struct ContentView: View {
     @State private var slotPreviews: [Int: String] = [:]
     @State private var activePasteSlot: Int = 0
     @State private var directInputText: String = ""
-    @State private var statusMessage: String = "RATT v2 Ready • Tap 'Paste from RATT' to choose a slot"
+    @State private var statusMessage: String = "RATT v2 Ready • Click 'Paste from Slot' to choose a slot"
     @State private var statusIsSuccess: Bool = true
     @State private var showUpgradeAlert: Bool = false
     @State private var upgradeReason: String = ""
     @State private var showPairDialog: Bool = false
     @State private var pairIpDraft: String = ""
-    @State private var showAndroidSyncBox: Bool = false
     @State private var androidIpDraft: String = ""
     @State private var androidIpAddress: String = ""
-    @State private var showInlinePasteSlotsTop: Bool = false
-    @State private var showInlinePasteSlotsInput: Bool = false
+    @State private var showPasteOverlayAboveKeyboard: Bool = false
     @State private var showInlineSaveSlotsInput: Bool = false
     @State private var pcIpAddress: String = ""
     @State private var iphoneIpAddress: String = ""
@@ -92,7 +90,7 @@ public struct ContentView: View {
 
     public var body: some View {
         NavigationView {
-            ZStack {
+            ZStack(alignment: .bottom) {
                 Color(hex: "#0A0D12")
                     .ignoresSafeArea()
                     .contentShape(Rectangle())
@@ -147,7 +145,7 @@ public struct ContentView: View {
                             dismissKeyboard()
                         }
 
-                        // ================= LIVE STATUS & ACTIVE PASTE SLOT BANNER =================
+                        // ================= LIVE STATUS BANNER =================
                         VStack(alignment: .leading, spacing: 4) {
                             HStack(spacing: 8) {
                                 Image(systemName: statusIsSuccess ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
@@ -160,7 +158,7 @@ public struct ContentView: View {
                                 Spacer()
                             }
                             if activePasteSlot > 0, let activeTxt = slotPreviews[activePasteSlot], !activeTxt.isEmpty {
-                                Text("📌 Selected to Paste Now: Slot #\(activePasteSlot) (\"\(activeTxt)\")")
+                                Text("📌 Active Paste Slot: Slot #\(activePasteSlot) (\"\(activeTxt)\")")
                                     .font(.system(size: 11, weight: .bold))
                                     .foregroundColor(Color(hex: "#39FF14"))
                                     .lineLimit(1)
@@ -178,114 +176,10 @@ public struct ContentView: View {
                             dismissKeyboard()
                         }
 
-                        // ================= 2. PASTE FROM RATT (IN-PLACE FILLED SLOT CHOOSER) =================
+                        // ================= 2. TYPE, SAVE TO SLOT, OR PASTE FROM SLOT =================
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
-                                Text("1️⃣ PASTE FROM RATT (CHOOSE FROM FILLED SLOTS)")
-                                    .font(.system(size: 11, weight: .bold))
-                                    .foregroundColor(Color(hex: "#39FF14"))
-                                Spacer()
-                                if activePasteSlot > 0 {
-                                    Text("Active: Slot #\(activePasteSlot)")
-                                        .font(.system(size: 10.5, weight: .bold))
-                                        .foregroundColor(Color(hex: "#39FF14"))
-                                }
-                            }
-
-                            if !showInlinePasteSlotsTop {
-                                // When user clicks "Paste from RATT", filled slots appear AT THIS EXACT SAME PLACE!
-                                Button(action: {
-                                    dismissKeyboard()
-                                    showInlinePasteSlotsTop = true
-                                }) {
-                                    HStack {
-                                        Image(systemName: "doc.on.clipboard.fill")
-                                        Text(filledSlotsList.isEmpty
-                                             ? "📋 Paste from RATT (No Slots Saved Yet)"
-                                             : "📋 Paste from RATT (\(filledSlotsList.count) Slot\(filledSlotsList.count == 1 ? "" : "s") Available — Tap to Choose)")
-                                    }
-                                    .font(.system(size: 13, weight: .bold))
-                                    .foregroundColor(.black)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 44)
-                                    .background(Color(hex: "#39FF14"))
-                                    .cornerRadius(8)
-                                }
-                            } else {
-                                // IN-PLACE FILLED SLOTS LIST (At the exact same place as "Paste from RATT"!)
-                                VStack(alignment: .leading, spacing: 6) {
-                                    HStack {
-                                        Text("Tap the slot you want to paste from:")
-                                            .font(.system(size: 11.5, weight: .bold))
-                                            .foregroundColor(Color(hex: "#39FF14"))
-                                        Spacer()
-                                        Button("Close ✕") {
-                                            showInlinePasteSlotsTop = false
-                                        }
-                                        .font(.system(size: 11, weight: .bold))
-                                        .foregroundColor(Color(hex: "#8B949E"))
-                                    }
-
-                                    if filledSlotsList.isEmpty {
-                                        Text("No slots contain data yet. Save text into a slot below first.")
-                                            .font(.system(size: 12))
-                                            .foregroundColor(Color(hex: "#8B949E"))
-                                            .padding(.vertical, 6)
-                                    } else {
-                                        ForEach(filledSlotsList, id: \.0) { (sId, sText) in
-                                            let sColor = PC_SLOT_COLORS[sId - 1]
-                                            let isSelected = (activePasteSlot == sId)
-                                            Button(action: {
-                                                copySlotToIphoneClipboard(slotId: sId, alsoInsertInInputBox: true)
-                                                showInlinePasteSlotsTop = false
-                                            }) {
-                                                HStack(spacing: 8) {
-                                                    Text("Slot #\(sId)")
-                                                        .font(.system(size: 11.5, weight: .bold))
-                                                        .foregroundColor(.white)
-                                                        .padding(.horizontal, 8)
-                                                        .frame(height: 26)
-                                                        .background(sColor)
-                                                        .cornerRadius(5)
-
-                                                    Text(sText)
-                                                        .font(.system(size: 13, weight: .bold))
-                                                        .foregroundColor(.white)
-                                                        .lineLimit(1)
-                                                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                                                    Text(isSelected ? "✓ ACTIVE" : "PASTE")
-                                                        .font(.system(size: 10.5, weight: .heavy))
-                                                        .foregroundColor(.black)
-                                                        .padding(.horizontal, 8)
-                                                        .padding(.vertical, 4)
-                                                        .background(Color(hex: "#39FF14"))
-                                                        .cornerRadius(4)
-                                                }
-                                                .padding(8)
-                                                .background(Color(hex: "#10241B"))
-                                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(sColor, lineWidth: 1.5))
-                                                .cornerRadius(6)
-                                            }
-                                        }
-                                    }
-                                }
-                                .padding(10)
-                                .background(Color(hex: "#0D1117"))
-                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(hex: "#39FF14"), lineWidth: 1.5))
-                                .cornerRadius(8)
-                            }
-                        }
-                        .padding(14)
-                        .background(Color(hex: "#161B22"))
-                        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color(hex: "#10B981"), lineWidth: 1.5))
-                        .cornerRadius(10)
-                        .padding(.horizontal)
-
-                        // ================= 3. SAVE OR PASTE AT TEXT BOX =================
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                Text("2️⃣ TYPE, SAVE TO SLOT, OR PASTE FROM RATT")
+                                Text("SAVE TO SLOT OR PASTE FROM SLOT")
                                     .font(.system(size: 11, weight: .bold))
                                     .foregroundColor(Color(hex: "#00BFFF"))
                                 Spacer()
@@ -297,7 +191,7 @@ public struct ContentView: View {
                             }
 
                             HStack(spacing: 6) {
-                                TextField("Type text here (or click Paste from RATT below)...", text: $directInputText)
+                                TextField("Type text here or click Paste from Slot...", text: $directInputText)
                                     .font(.system(size: 13))
                                     .foregroundColor(.white)
                                     .padding(10)
@@ -308,7 +202,6 @@ public struct ContentView: View {
                                 if !directInputText.isEmpty {
                                     Button(action: {
                                         directInputText = ""
-                                        dismissKeyboard()
                                     }) {
                                         Image(systemName: "xmark.circle.fill")
                                             .foregroundColor(Color(hex: "#8B949E"))
@@ -317,76 +210,48 @@ public struct ContentView: View {
                                 }
                             }
 
-                            // When user clicks "Paste from RATT" right here, the filled slots appear AT THIS EXACT SAME PLACE!
-                            if showInlinePasteSlotsInput {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    HStack {
-                                        Text("📋 Choose which slot to paste:")
-                                            .font(.system(size: 11.5, weight: .bold))
-                                            .foregroundColor(Color(hex: "#39FF14"))
-                                        Spacer()
-                                        Button("Back ✕") {
-                                            showInlinePasteSlotsInput = false
-                                        }
-                                        .font(.system(size: 11, weight: .bold))
-                                        .foregroundColor(Color(hex: "#8B949E"))
+                            HStack(spacing: 8) {
+                                Button(action: {
+                                    showPasteOverlayAboveKeyboard = false
+                                    showInlineSaveSlotsInput.toggle()
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "square.and.arrow.down.fill")
+                                        Text("Save to Slot")
                                     }
-
-                                    if filledSlotsList.isEmpty {
-                                        Text("No slots contain data yet. Save text to a slot first.")
-                                            .font(.system(size: 12))
-                                            .foregroundColor(Color(hex: "#8B949E"))
-                                            .padding(.vertical, 4)
-                                    } else {
-                                        ForEach(filledSlotsList, id: \.0) { (sId, sText) in
-                                            let sColor = PC_SLOT_COLORS[sId - 1]
-                                            Button(action: {
-                                                copySlotToIphoneClipboard(slotId: sId, alsoInsertInInputBox: true)
-                                                showInlinePasteSlotsInput = false
-                                            }) {
-                                                HStack(spacing: 8) {
-                                                    Text("Slot #\(sId)")
-                                                        .font(.system(size: 11.5, weight: .bold))
-                                                        .foregroundColor(.white)
-                                                        .padding(.horizontal, 8)
-                                                        .frame(height: 26)
-                                                        .background(sColor)
-                                                        .cornerRadius(5)
-
-                                                    Text(sText)
-                                                        .font(.system(size: 13, weight: .bold))
-                                                        .foregroundColor(.white)
-                                                        .lineLimit(1)
-                                                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                                                    Text("PASTE")
-                                                        .font(.system(size: 10.5, weight: .heavy))
-                                                        .foregroundColor(.black)
-                                                        .padding(.horizontal, 8)
-                                                        .padding(.vertical, 4)
-                                                        .background(Color(hex: "#39FF14"))
-                                                        .cornerRadius(4)
-                                                }
-                                                .padding(8)
-                                                .background(Color(hex: "#10241B"))
-                                                .overlay(RoundedRectangle(cornerRadius: 6).stroke(sColor, lineWidth: 1.5))
-                                                .cornerRadius(6)
-                                            }
-                                        }
-                                    }
+                                    .font(.system(size: 12.5, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 42)
+                                    .background(Color(hex: "#00BFFF"))
+                                    .cornerRadius(6)
                                 }
-                                .padding(10)
-                                .background(Color(hex: "#0D1117"))
-                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(hex: "#39FF14"), lineWidth: 1.5))
-                                .cornerRadius(8)
-                            } else if showInlineSaveSlotsInput {
+
+                                Button(action: {
+                                    showInlineSaveSlotsInput = false
+                                    showPasteOverlayAboveKeyboard.toggle()
+                                }) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "doc.on.clipboard.fill")
+                                        Text("Paste from Slot")
+                                    }
+                                    .font(.system(size: 12.5, weight: .bold))
+                                    .foregroundColor(.black)
+                                    .frame(maxWidth: .infinity)
+                                    .frame(height: 42)
+                                    .background(Color(hex: "#39FF14"))
+                                    .cornerRadius(6)
+                                }
+                            }
+
+                            if showInlineSaveSlotsInput {
                                 VStack(alignment: .leading, spacing: 6) {
                                     HStack {
-                                        Text("📥 Choose which slot (1–10) to save into:")
+                                        Text("Tap which slot (1–10) to save into:")
                                             .font(.system(size: 11.5, weight: .bold))
                                             .foregroundColor(Color(hex: "#00BFFF"))
                                         Spacer()
-                                        Button("Back ✕") {
+                                        Button("Close ✕") {
                                             showInlineSaveSlotsInput = false
                                         }
                                         .font(.system(size: 11, weight: .bold))
@@ -422,45 +287,9 @@ public struct ContentView: View {
                                     }
                                 }
                                 .padding(10)
-                                .background(Color(hex: "#0D1117"))
+                                .background(Color.black.opacity(0.85))
                                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(hex: "#00BFFF"), lineWidth: 1.5))
                                 .cornerRadius(8)
-                            } else {
-                                HStack(spacing: 8) {
-                                    Button(action: {
-                                        dismissKeyboard()
-                                        showInlinePasteSlotsInput = false
-                                        showInlineSaveSlotsInput = true
-                                    }) {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "square.and.arrow.down.fill")
-                                            Text("Save to Slot")
-                                        }
-                                        .font(.system(size: 12, weight: .bold))
-                                        .foregroundColor(.white)
-                                        .frame(maxWidth: .infinity)
-                                        .frame(height: 40)
-                                        .background(Color(hex: "#00BFFF"))
-                                        .cornerRadius(6)
-                                    }
-
-                                    Button(action: {
-                                        dismissKeyboard()
-                                        showInlineSaveSlotsInput = false
-                                        showInlinePasteSlotsInput = true
-                                    }) {
-                                        HStack(spacing: 4) {
-                                            Image(systemName: "doc.on.clipboard.fill")
-                                            Text("Paste from RATT")
-                                        }
-                                        .font(.system(size: 12, weight: .bold))
-                                        .foregroundColor(.black)
-                                        .frame(maxWidth: .infinity)
-                                        .frame(height: 40)
-                                        .background(Color(hex: "#39FF14"))
-                                        .cornerRadius(6)
-                                    }
-                                }
                             }
                         }
                         .padding(14)
@@ -469,7 +298,7 @@ public struct ContentView: View {
                         .cornerRadius(10)
                         .padding(.horizontal)
 
-                        // ================= 4. LIVE 10-SLOT PREVIEW =================
+                        // ================= 3. LIVE 10-SLOT PREVIEW =================
                         VStack(alignment: .leading, spacing: 6) {
                             Text("LIVE 10-SLOT PREVIEW (TAP 'PASTE' OR RED 'X' TO CLEAR)")
                                 .font(.system(size: 10, weight: .bold))
@@ -503,9 +332,9 @@ public struct ContentView: View {
                             .padding(.top, 4)
                         }
 
-                        // ================= 5. SYNC WITH ANDROID & MACOS =================
+                        // ================= 4. PAIR & SYNC WITH RATT ANDROID =================
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("3️⃣ PAIR & SYNC WITH RATT ANDROID (TWO-WAY WI-FI SYNC)")
+                            Text("PAIR & SYNC WITH RATT ANDROID (TWO-WAY WI-FI SYNC)")
                                 .font(.system(size: 10.5, weight: .bold))
                                 .foregroundColor(Color(hex: "#39FF14"))
 
@@ -573,7 +402,7 @@ public struct ContentView: View {
                         .cornerRadius(10)
                         .padding(.horizontal)
 
-                        // ================= 6. IP / WI-FI PC SYNC CARD =================
+                        // ================= 5. IP / WI-FI PC SYNC CARD =================
                         VStack(alignment: .leading, spacing: 8) {
                             HStack {
                                 VStack(alignment: .leading, spacing: 2) {
@@ -750,52 +579,7 @@ public struct ContentView: View {
                         .cornerRadius(10)
                         .padding(.horizontal)
 
-                        // ================= 7. KEYBOARD SETUP =================
-                        VStack(alignment: .leading, spacing: 8) {
-                            HStack {
-                                HStack(spacing: 6) {
-                                    Circle()
-                                        .fill(Color(hex: "#39FF14"))
-                                        .frame(width: 8, height: 8)
-                                    Text("RATT KEYBOARD (CHOOSE SLOTS INSIDE ANY APP)")
-                                        .font(.system(size: 10.5, weight: .bold))
-                                        .foregroundColor(Color(hex: "#39FF14"))
-                                }
-                                Spacer()
-                                Button(action: {
-                                    dismissKeyboard()
-                                    if let url = URL(string: UIApplication.openSettingsURLString) {
-                                        UIApplication.shared.open(url)
-                                    }
-                                }) {
-                                    HStack(spacing: 4) {
-                                        Image(systemName: "gearshape.fill")
-                                        Text("Open Settings")
-                                    }
-                                    .font(.system(size: 10.5, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .padding(.horizontal, 9)
-                                    .padding(.vertical, 5)
-                                    .background(Color(hex: "#238636"))
-                                    .cornerRadius(6)
-                                }
-                            }
-
-                            Text("Settings → General → Keyboard → Keyboards → Add 'RATT v2' → Enable 'Allow Full Access'")
-                                .font(.system(size: 10))
-                                .foregroundColor(Color(hex: "#8B949E"))
-                        }
-                        .padding(10)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(Color(hex: "#161B22"))
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color(hex: "#30363D"), lineWidth: 1))
-                        .cornerRadius(8)
-                        .padding(.horizontal)
-                        .onTapGesture {
-                            dismissKeyboard()
-                        }
-
-                        // ================= 8. EXIT & WIPE SLOTS =================
+                        // ================= 6. EXIT & WIPE SLOTS =================
                         Button(action: {
                             dismissKeyboard()
                             emptySlotsAndExit()
@@ -813,8 +597,92 @@ public struct ContentView: View {
                             .cornerRadius(6)
                         }
                         .padding(.horizontal)
-                        .padding(.bottom, 24)
+                        .padding(.bottom, 90)
                     }
+                }
+
+                // ================= TRANSPARENT BLACK OVERLAY ON TOP OF KEYBOARD =================
+                // Appears directly on top of the keyboard in a transparent black background
+                // when the user clicks "Paste from Slot"!
+                if showPasteOverlayAboveKeyboard {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("📋 Choose Slot to Paste:")
+                                .font(.system(size: 13, weight: .heavy))
+                                .foregroundColor(Color(hex: "#39FF14"))
+                            Spacer()
+                            Button(action: {
+                                showPasteOverlayAboveKeyboard = false
+                            }) {
+                                Text("Close ✕")
+                                    .font(.system(size: 11.5, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 10)
+                                    .padding(.vertical, 4)
+                                    .background(Color.white.opacity(0.18))
+                                    .cornerRadius(6)
+                            }
+                        }
+
+                        if filledSlotsList.isEmpty {
+                            Text("No slots contain data yet. Save text into a slot first.")
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundColor(.white)
+                                .padding(.vertical, 8)
+                        } else {
+                            ScrollView(.vertical, showsIndicators: true) {
+                                VStack(spacing: 6) {
+                                    ForEach(filledSlotsList, id: \.0) { (sId, sText) in
+                                        let sColor = PC_SLOT_COLORS[sId - 1]
+                                        let isSelected = (activePasteSlot == sId)
+                                        Button(action: {
+                                            copySlotToIphoneClipboard(slotId: sId, alsoInsertInInputBox: true)
+                                            showPasteOverlayAboveKeyboard = false
+                                        }) {
+                                            HStack(spacing: 8) {
+                                                Text("#\(sId)")
+                                                    .font(.system(size: 12, weight: .bold))
+                                                    .foregroundColor(.white)
+                                                    .frame(width: 34, height: 28)
+                                                    .background(sColor)
+                                                    .cornerRadius(5)
+
+                                                Text(sText)
+                                                    .font(.system(size: 13.5, weight: .bold))
+                                                    .foregroundColor(.white)
+                                                    .lineLimit(1)
+                                                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                                                Text(isSelected ? "✓ ACTIVE" : "PASTE")
+                                                    .font(.system(size: 10.5, weight: .heavy))
+                                                    .foregroundColor(.black)
+                                                    .padding(.horizontal, 9)
+                                                    .padding(.vertical, 5)
+                                                    .background(Color(hex: "#39FF14"))
+                                                    .cornerRadius(5)
+                                            }
+                                            .padding(8)
+                                            .background(Color.black.opacity(0.65))
+                                            .overlay(RoundedRectangle(cornerRadius: 7).stroke(sColor, lineWidth: 1.5))
+                                            .cornerRadius(7)
+                                        }
+                                        .buttonStyle(PlainButtonStyle())
+                                    }
+                                }
+                            }
+                            .frame(maxHeight: 190)
+                        }
+                    }
+                    .padding(12)
+                    .background(Color.black.opacity(0.84))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 12)
+                            .stroke(Color(hex: "#39FF14"), lineWidth: 1.5)
+                    )
+                    .cornerRadius(12)
+                    .padding(.horizontal, 10)
+                    .padding(.bottom, 6)
+                    .shadow(color: Color.black.opacity(0.6), radius: 10, x: 0, y: -3)
                 }
             }
             .navigationBarHidden(true)
@@ -894,7 +762,6 @@ public struct ContentView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                     .onTapGesture {
-                        dismissKeyboard()
                         copySlotToIphoneClipboard(slotId: slotId, alsoInsertInInputBox: true)
                     }
             } else {
@@ -907,7 +774,6 @@ public struct ContentView: View {
 
             if hasData {
                 Button(action: {
-                    dismissKeyboard()
                     copySlotToIphoneClipboard(slotId: slotId, alsoInsertInInputBox: true)
                 }) {
                     Text(isSelectedForPaste ? "✓ Active" : "Paste")
@@ -922,7 +788,6 @@ public struct ContentView: View {
             }
 
             Button(action: {
-                dismissKeyboard()
                 saveClipboardToSlot(slotId: slotId)
             }) {
                 Text("Save")
@@ -935,9 +800,8 @@ public struct ContentView: View {
             }
             .buttonStyle(PlainButtonStyle())
 
-            // Red X Button — Immediately clears this slot from memory, disk, UI, and paired devices
+            // Red X Button — Immediately clears this slot
             Button(action: {
-                dismissKeyboard()
                 clearSlot(slotId: slotId)
             }) {
                 Text("X")
@@ -1006,7 +870,7 @@ public struct ContentView: View {
         sendSlotToAllPairedPeers(slotId: slotId, text: text)
         refreshSlots()
         if okStore || okGroup {
-            setStatus("✅ Saved to Slot #\(slotId)! Tap 'Paste from RATT' to choose which slot to paste.", ok: true)
+            setStatus("✅ Saved to Slot #\(slotId)! Click 'Paste from Slot' to choose which slot to paste.", ok: true)
         } else {
             setStatus("⚠️ Security Guard blocked unsafe link or script in Slot #\(slotId).", ok: false)
         }
@@ -1025,7 +889,7 @@ public struct ContentView: View {
         }
         dataManager.syncPasteboardCarrier(activeSlotId: slotId, explicitActiveText: txt)
         UINotificationFeedbackGenerator().notificationOccurred(.success)
-        setStatus("📋 Pasted Slot #\(slotId) (\"\(txt.prefix(24))\") & loaded into iPhone Clipboard!", ok: true)
+        setStatus("📋 Selected Slot #\(slotId) (\"\(txt.prefix(24))\") for Paste!", ok: true)
     }
 
     private func saveClipboardToSlot(slotId: Int) {
@@ -1038,7 +902,7 @@ public struct ContentView: View {
         if let clip = UIPasteboard.general.string, !clip.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             saveTextToSlot(slotId: slotId, text: clip)
         } else {
-            setStatus("Type text in the box in Section 2️⃣ first, then tap Save.", ok: false)
+            setStatus("Type text in the box first, then tap Save to Slot.", ok: false)
         }
     }
 
@@ -1157,13 +1021,11 @@ public struct ContentView: View {
         }
     }
 
-    /// Pairs and performs full Two-Way Sync (Push + Pull) with either an Android phone (49210) or PC (49211).
     private func syncWithRemoteDevice(targetIp: String, platformLabel: String) {
         setStatus("🔄 Connecting to \(platformLabel) (\(targetIp))...", ok: true)
         let myIp = dataManager.getDeviceIpAddress()
         let token = dataManager.getOrCreateSyncToken()
 
-        // 1. Send /pair handshake to both 49210 and 49211 so target adopts our token and IP
         for port in [49210, 49211] {
             if let pairUrl = URL(string: "http://\(targetIp):\(port)/pair") {
                 var req = URLRequest(url: pairUrl)
@@ -1202,7 +1064,6 @@ public struct ContentView: View {
             }
         }
 
-        // 2. Push all filled iPhone slots to both 49210 and 49211
         var pushedCount = 0
         for s in 1...10 {
             if let text = slotPreviews[s] ?? store.decryptSlot(s), !text.isEmpty {
@@ -1228,7 +1089,6 @@ public struct ContentView: View {
             }
         }
 
-        // 3. Pull all filled slots from target (trying both 49210 and 49211)
         for port in [49210, 49211] {
             guard let pullUrl = URL(string: "http://\(targetIp):\(port)/get_all_slots") else { continue }
             var pullReq = URLRequest(url: pullUrl)

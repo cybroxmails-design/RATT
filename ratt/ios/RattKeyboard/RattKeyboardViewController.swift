@@ -310,7 +310,8 @@ class RattKeyboardViewController: UIInputViewController {
     private func setupSlotListOverlay() {
         let scroll = UIScrollView()
         scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.backgroundColor = UIColor(red: 0.08, green: 0.10, blue: 0.14, alpha: 0.98)
+        // Transparent black background floating on top of the keyboard keys
+        scroll.backgroundColor = UIColor(white: 0.0, alpha: 0.80)
         scroll.layer.cornerRadius = 10
         scroll.layer.borderWidth = 1.5
         scroll.layer.borderColor = UIColor(red: 0.22, green: 1.0, blue: 0.08, alpha: 1.0).cgColor
@@ -367,8 +368,9 @@ class RattKeyboardViewController: UIInputViewController {
             topSecondaryLabel.text = "Paste from RATT v2"
         }
 
+        // Keep the QWERTY keys visible behind the transparent black slot list overlay!
         slotListScroll.isHidden = !isShowingSlotList
-        keysContainer.isHidden = isShowingSlotList
+        keysContainer.isHidden = false
 
         guard isShowingSlotList else { return }
 
