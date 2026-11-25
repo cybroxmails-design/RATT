@@ -387,13 +387,34 @@ class RattApp:
         )
         android_btn.pack(side=tk.LEFT, padx=2)
         android_btn.bind("<Button-3>", lambda e: self._prompt_pair_android())
-        tk.Button(
+        ios_btn = tk.Button(
             toolbar, text="iOS Sync", font=FONT_SMALL,
-            fg=TEXT_PRIMARY, bg="#0277BD" if config.is_premium else BG_HOVER,
-            activebackground="#0288D1" if config.is_premium else BG_ACTIVE,
+            fg=TEXT_PRIMARY, bg="#0277BD",
+            activebackground="#0288D1",
             relief=tk.FLAT, padx=12, pady=3, cursor="hand2",
             command=self._on_ios_sync_btn
-        ).pack(side=tk.LEFT, padx=2)
+        )
+        ios_btn.pack(side=tk.LEFT, padx=2)
+        ios_btn.bind("<Button-3>", lambda e: self._prompt_pair_android())
+
+        from ratt.hal import android_bridge
+        pc_ip, _ = android_bridge.get_wifi_network_info()
+        pc_ip_str = pc_ip or "127.0.0.1"
+        ip_badge = tk.Button(
+            toolbar,
+            text=f"PC IP: {pc_ip_str}",
+            font=(FONT_FAMILY, 9, "bold"),
+            fg="#39FF14",
+            bg="#0D1F17",
+            activebackground="#133024",
+            activeforeground="#FFFFFF",
+            relief=tk.FLAT,
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            command=self._copy_and_show_pc_ip,
+        )
+        ip_badge.pack(side=tk.LEFT, padx=(6, 2))
 
         from ratt.config import UserTier
         tier_labels = {
@@ -605,11 +626,11 @@ class RattApp:
         state_badge = "ON (Active)" if config.enabled else "OFF (Keyboard & Mouse Released \u2014 Ctrl+Alt+P)"
         from ratt.hal import android_bridge
         pc_ip, _ = android_bridge.get_wifi_network_info()
-        ip_display = f"  |  PC IP: {pc_ip}" if pc_ip else ""
+        ip_display = f"PC IP: {pc_ip}  |  " if pc_ip else ""
         try:
             self.status_label.config(
-                text=f"  {config.APP_NAME} v{config.VERSION} [{state_badge}]  |  "
-                     f"{tier_text} ({config.max_slots:,} slots)  |  {len(slots)} slot(s) in use{ip_display}",
+                text=f"  {ip_display}{config.APP_NAME} v{config.VERSION} [{state_badge}]  |  "
+                     f"{tier_text} ({config.max_slots:,} slots)  |  {len(slots)} slot(s) in use",
                 fg=TEXT_SECONDARY if config.enabled else "#FFC107",
             )
         except (tk.TclError, AttributeError):
@@ -785,7 +806,7 @@ class RattApp:
         pc_pin = android_bridge.generate_pairing_pin()
 
         dlg = tk.Toplevel(self.root)
-        dlg.title("Pair Android Phone (Secure PIN)")
+        dlg.title("Pair iPhone (iOS) or Android Phone — Wi-Fi Sync")
         dlg.transient(self.root)
         dlg.grab_set()
         dlg.resizable(True, True)
@@ -838,12 +859,14 @@ class RattApp:
             ).pack(fill="x", pady=(0, 8))
 
         info_text = (
-            f"Option A (From Phone): On Android -> tap 'Pair with PC'\n"
-            f"   Enter PC IP: {pc_ip or '<your-pc-ip>'}   and   PC PIN: {pc_pin}  (valid 5 min)\n\n"
-            f"Option B (From PC): Enter your Phone IP and the Phone's 6-digit PIN\n"
-            f"   (shown inside Android's 'Pair with PC' popup), then click Pair Now:"
+            f"THIS PC IP ADDRESS:  {pc_ip or '127.0.0.1'}   |   PC PIN (Android):  {pc_pin}\n\n"
+            f"• Option A (From iPhone / iOS): On iPhone RATT -> tap 'Pair with PC',\n"
+            f"  enter PC IP: {pc_ip or '<your-pc-ip>'} and tap 'Save & Pair Now'.\n"
+            f"• Option B (From Android): On Android RATT -> tap 'Pair with PC',\n"
+            f"  enter PC IP: {pc_ip or '<your-pc-ip>'} and PC PIN: {pc_pin}.\n"
+            f"• Option C (From PC): Enter your iPhone or Android IP below and click 'Pair Now':"
         )
-        tk.Label(frame, text=info_text, font=("Segoe UI", 9), justify="left", anchor="w", wraplength=500).pack(fill="x", pady=(0, 10))
+        tk.Label(frame, text=info_text, font=("Segoe UI", 9, "bold"), justify="left", anchor="w", wraplength=500).pack(fill="x", pady=(0, 10))
 
         row1 = tk.Frame(frame)
         row1.pack(fill="x", pady=4)
@@ -854,7 +877,7 @@ class RattApp:
 
         row2 = tk.Frame(frame)
         row2.pack(fill="x", pady=4)
-        tk.Label(row2, text="Phone 6-Digit PIN:", width=18, anchor="w", font=("Segoe UI", 9, "bold")).pack(side="left")
+        tk.Label(row2, text="Android PIN (opt):", width=18, anchor="w", font=("Segoe UI", 9, "bold")).pack(side="left")
         pin_var = tk.StringVar(value="")
         pin_entry = tk.Entry(row2, textvariable=pin_var, width=28, font=("Consolas", 10))
         pin_entry.pack(side="left", fill="x", expand=True)
@@ -863,17 +886,14 @@ class RattApp:
             target_ip = ip_var.get().strip()
             entered_pin = pin_var.get().strip()
             if not target_ip:
-                status_var.set("Please enter your Android Phone's IP address.")
+                status_var.set("Please enter your iPhone or Android Phone's IP address.")
                 return
             android_bridge.set_paired_android_ip(target_ip)
-            if not entered_pin:
-                status_var.set(f"Saved Phone IP ({target_ip}). Enter PC PIN {pc_pin} on Android, or enter Phone PIN above.")
-                return
             if entered_pin == pc_pin:
-                status_var.set("That is the PC PIN. Enter the Phone's PIN shown on Android (or enter this PC PIN on Android).")
+                status_var.set("That is the PC PIN. For iPhone leave PIN blank; for Android enter the Phone's PIN.")
                 return
             pair_btn.config(state="disabled", text="Pairing...")
-            status_var.set(f"Pairing with {target_ip}:49210...")
+            status_var.set(f"Pairing with {target_ip} (port 49211 / 49210)...")
 
             def _do_pair():
                 ok, msg = android_bridge.pair_with_android_device(target_ip, pin=entered_pin)
@@ -884,7 +904,10 @@ class RattApp:
                     if ok:
                         dlg.destroy()
                         self.show_notification(msg)
-                        self.root.after(150, self._on_android_sync_btn)
+                        if "iPhone" in msg or "iOS" in msg:
+                            self.root.after(150, self._on_ios_sync_btn)
+                        else:
+                            self.root.after(150, self._on_android_sync_btn)
                     else:
                         status_lbl.config(fg="#b91c1c")
                         status_var.set(msg)
@@ -1062,23 +1085,88 @@ class RattApp:
                 f"Connected to Phone ({paired_ip}), but no slots contain data yet. Copy text on Phone or PC to start syncing!"
             )
 
+    def _copy_and_show_pc_ip(self):
+        """Copy this PC's LAN IPv4 address to the clipboard and open the Phone Pairing dialog."""
+        from ratt.hal import android_bridge
+        pc_ip, _ = android_bridge.get_wifi_network_info()
+        ip_str = pc_ip or "127.0.0.1"
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(ip_str)
+        except Exception:
+            pass
+        self.show_notification(f"PC IP ({ip_str}) copied! Enter this IP in RATT on your iPhone or Android.")
+        self._show_android_pair_dialog()
+
     def _on_ios_sync_btn(self):
-        """Handle iOS Sync button click from the main toolbar."""
-        import sys
-        if sys.platform != "darwin" and not config.is_premium:
-            from ratt.clipboard_manager import UPGRADE_IOS_MSG
-            self.request_upgrade(UPGRADE_IOS_MSG.split("UPGRADE_REQUIRED:", 1)[1].strip())
+        """Handle iOS Sync button click from the main toolbar (two-way Wi-Fi sync on port 49211)."""
+        from ratt.hal import android_bridge
+        import json
+        import urllib.request
+
+        paired_ip = android_bridge.get_paired_android_ip()
+        if not paired_ip or paired_ip in ("127.0.0.1", "localhost"):
+            self._show_android_pair_dialog()
             return
-        filled = sorted(self.clipboard_manager.get_all_slots().keys())
-        slot_num = filled[0] if filled else 1
-        if self.clipboard_manager.copy_to_ios(slot_num):
-            self.show_notification(f"Synced Slot #{slot_num} to iPhone Keyboard (iOS)")
-        elif self.clipboard_manager.last_error:
-            err = self.clipboard_manager.last_error
-            if err.startswith("UPGRADE_REQUIRED:"):
-                self.request_upgrade(err.split("UPGRADE_REQUIRED:", 1)[1].strip())
-            else:
-                self.show_notification(err, is_error=True)
+
+        pulled_count = 0
+        pushed_count = 0
+        phone_slots = {}
+        try:
+            url = f"http://{paired_ip}:49211/get_all_slots"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "RATT-PC", "X-RATT-Token": android_bridge.get_pc_sync_token()},
+            )
+            with urllib.request.urlopen(req, timeout=3.5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                phone_slots = data.get("slots", {})
+                from ratt.clipboard_manager import SlotContentType
+                for slot_str, content in phone_slots.items():
+                    if str(slot_str).isdigit():
+                        s_num = int(slot_str)
+                        if 1 <= s_num <= 10 and content:
+                            cur_slot = self.clipboard_manager.get_slot(s_num)
+                            if cur_slot and cur_slot.content_type in (SlotContentType.FILES, SlotContentType.IMAGE, SlotContentType.DIAGRAM):
+                                continue
+                            self.clipboard_manager.copy_to_slot(s_num, text=content)
+                            pulled_count += 1
+        except Exception as e:
+            self._show_android_pair_dialog(initial_ip=paired_ip, err_msg=str(e))
+            return
+
+        pc_slots = self.clipboard_manager.get_all_slots()
+        for slot_num, slot_obj in pc_slots.items():
+            if 1 <= slot_num <= 10 and slot_obj and not slot_obj.is_empty:
+                pc_content = slot_obj.content or slot_obj.preview or ""
+                if pc_content and phone_slots.get(str(slot_num), "") != pc_content:
+                    try:
+                        payload = json.dumps({
+                            "action": "SYNC_TO_PHONE",
+                            "slot_id": slot_num,
+                            "content": pc_content,
+                            "timestamp": time.time(),
+                            "nonce": f"{int(time.time()*1000)}_{slot_num}",
+                        }).encode("utf-8")
+                        req = urllib.request.Request(
+                            f"http://{paired_ip}:49211/sync_slot",
+                            data=payload,
+                            headers={
+                                "Content-Type": "application/json",
+                                "User-Agent": "RATT-PC",
+                                "X-RATT-Token": android_bridge.get_pc_sync_token(),
+                            },
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(req, timeout=2.5) as _:
+                            pushed_count += 1
+                    except Exception:
+                        pass
+
+        self._refresh_slots()
+        self.show_notification(
+            f"iPhone (iOS) Sync Complete ({paired_ip}): Pulled {pulled_count}, Pushed {pushed_count} slot(s)."
+        )
     
     def copy_to_slot(self, slot_num):
         """Copy current clipboard content to a slot."""

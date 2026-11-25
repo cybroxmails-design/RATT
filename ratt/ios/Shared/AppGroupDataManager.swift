@@ -1,13 +1,8 @@
 // iOS AppGroupDataManager.swift - Shared Secure Container, Two-Way Sync Server & Notification
-// (`mobile_implimentation.pdf` Section 6: Phase 3 iPhone Slot Palette Extension)
-//
-// Manages the shared App Group container (`group.com.cybrox.ratt`), AES-256-GCM encrypted
-// slot files (`slot_\(id).enc`) backed by iOS Keychain Services / Secure Enclave
-// (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`), ECDH (Curve25519) + HKDF-SHA256 session
-// key derivation, replay protection (±120s + nonce cache), `memset_s` memory sanitization on
-// deletion/exit (`MEM-003`), and cross-process Darwin notifications (`com.cybrox.ratt.slotCleared`).
+// Compatible with iPhone X (iOS 15+) through iPhone 17 Pro Max, including Sideloadly installs.
 
 import Foundation
+import UIKit
 import Security
 import CryptoKit
 import Darwin
@@ -54,10 +49,14 @@ public struct RattSlot: Codable, Identifiable {
 
 public class AppGroupDataManager {
     public static let shared = AppGroupDataManager()
-    private let groupURL: URL? = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.cybrox.ratt")
+    private let groupURL: URL? = {
+        if let url = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.cybrox.ratt") {
+            return url
+        }
+        // Fallback for Sideloadly / free Apple ID installs where App Group entitlement is stripped
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+    }()
     private let keychainService = "com.cybrox.ratt.keychain"
-    private let keychainAccount = "com.cybrox.ratt.masterkey.v2"
-    private let keychainAccessGroup = "com.cybrox.ratt"
     private let syncTokenAccount = "com.cybrox.ratt.synctoken.v2"
     private let replayWindowSeconds: TimeInterval = 120.0
     private var seenNonces: [String: TimeInterval] = [:]
@@ -66,7 +65,7 @@ public class AppGroupDataManager {
 
     public init() {}
 
-    /// Store encrypted slot payload (`slot_\(id).enc`) in the shared App Group container using AES-256-GCM.
+    /// Store encrypted slot payload (`slot_\(id).enc`) in the container using AES-256-GCM.
     @discardableResult
     public func saveSlot(
         id: Int,
@@ -82,6 +81,9 @@ public class AppGroupDataManager {
         let (isSafe, cleanText) = RattSecurityGuard.sanitizeText(content)
         guard isSafe else { return false }
 
+        // Always persist in KeychainSlotStore first so decryptSlot(id) works immediately
+        KeychainSlotStore.shared.encryptAndStore(slot: id, text: cleanText)
+
         let slotObj = RattSlot(
             id: id,
             content: cleanText,
@@ -93,54 +95,52 @@ public class AppGroupDataManager {
             dimensions: dimensions
         )
 
-        guard var plainData = try? JSONEncoder().encode(slotObj),
-              let key = getOrCreateMasterKey() else {
-            return false
-        }
-        defer {
-            // Sanitize temporary plaintext buffer in RAM via memset_s (MEM-003)
-            plainData.withUnsafeMutableBytes { ptr in
-                if let base = ptr.baseAddress, ptr.count > 0 {
-                    _ = memset_s(base, ptr.count, 0, ptr.count)
-                }
-            }
-        }
-        guard let sealed = try? AES.GCM.seal(plainData, using: key),
-              let combined = sealed.combined else {
-            return false
-        }
-        guard let container = groupURL else { return false }
-        let slotFile = container.appendingPathComponent("slot_\(id).enc")
-        try? combined.write(to: slotFile, options: [.atomic, .completeFileProtection])
-        KeychainSlotStore.shared.encryptAndStore(slot: id, text: cleanText)
-        NotificationCenter.default.post(name: .slotUpdated, object: nil)
-        return true
-    }
-
-    /// Read and decrypt `slot_\(id).enc` from the shared App Group container.
-    public func loadSlot(id: Int) -> RattSlot? {
-        guard (1...10).contains(id), let container = groupURL else { return nil }
-        let slotFile = container.appendingPathComponent("slot_\(id).enc")
-        if let encryptedData = try? Data(contentsOf: slotFile),
-           let key = getOrCreateMasterKey(),
-           let box = try? AES.GCM.SealedBox(combined: encryptedData),
-           var decrypted = try? AES.GCM.open(box, using: key) {
+        let key = KeychainSlotStore.shared.getOrCreateMasterKey()
+        if var plainData = try? JSONEncoder().encode(slotObj) {
             defer {
-                decrypted.withUnsafeMutableBytes { ptr in
+                plainData.withUnsafeMutableBytes { ptr in
                     if let base = ptr.baseAddress, ptr.count > 0 {
                         _ = memset_s(base, ptr.count, 0, ptr.count)
                     }
                 }
             }
-            // 1. Try decoding as JSON RattSlot object
-            if let slot = try? JSONDecoder().decode(RattSlot.self, from: decrypted) {
-                return slot
+            if let sealed = try? AES.GCM.seal(plainData, using: key),
+               let combined = sealed.combined,
+               let container = groupURL {
+                let slotFile = container.appendingPathComponent("slot_\(id).enc")
+                try? combined.write(to: slotFile, options: [.atomic])
             }
-            // 2. Legacy fallback: raw string
-            if let text = String(data: decrypted, encoding: .utf8) {
-                let (isSafe, clean) = RattSecurityGuard.sanitizeText(text)
-                if isSafe {
-                    return RattSlot(id: id, content: clean)
+        }
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .slotUpdated, object: nil)
+        }
+        return true
+    }
+
+    /// Read and decrypt `slot_\(id).enc` from the container or KeychainSlotStore fallback.
+    public func loadSlot(id: Int) -> RattSlot? {
+        guard (1...10).contains(id) else { return nil }
+        let key = KeychainSlotStore.shared.getOrCreateMasterKey()
+        if let container = groupURL {
+            let slotFile = container.appendingPathComponent("slot_\(id).enc")
+            if let encryptedData = try? Data(contentsOf: slotFile),
+               let box = try? AES.GCM.SealedBox(combined: encryptedData),
+               var decrypted = try? AES.GCM.open(box, using: key) {
+                defer {
+                    decrypted.withUnsafeMutableBytes { ptr in
+                        if let base = ptr.baseAddress, ptr.count > 0 {
+                            _ = memset_s(base, ptr.count, 0, ptr.count)
+                        }
+                    }
+                }
+                if let slot = try? JSONDecoder().decode(RattSlot.self, from: decrypted) {
+                    return slot
+                }
+                if let text = String(data: decrypted, encoding: .utf8) {
+                    let (isSafe, clean) = RattSecurityGuard.sanitizeText(text)
+                    if isSafe {
+                        return RattSlot(id: id, content: clean)
+                    }
                 }
             }
         }
@@ -151,7 +151,6 @@ public class AppGroupDataManager {
     }
 
     public func clearSlot(id: Int) {
-        // Purges slot payload from shared container and zeroes file bytes via memset_s (MEM-003)
         if let container = groupURL {
             let slotFile = container.appendingPathComponent("slot_\(id).enc")
             if var existing = try? Data(contentsOf: slotFile) {
@@ -165,7 +164,6 @@ public class AppGroupDataManager {
             try? FileManager.default.removeItem(at: slotFile)
         }
         KeychainSlotStore.shared.clearSlot(id)
-        // Dispatches cross-process Darwin notification to Keyboard Extension
         let name = CFNotificationName("com.cybrox.ratt.slotCleared" as CFString)
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), name, nil, nil, true)
     }
@@ -189,14 +187,11 @@ public class AppGroupDataManager {
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), name, nil, nil, true)
     }
 
-    /// Requirement 5 (`exitAndWipeAllSlots`): Zeroes and deletes all slots in RAM, App Group container,
-    /// and Keychain-backed store when the user exits or backgrounds the RATT iOS app.
     public func exitAndWipeAllSlots() {
         clearAllSlots()
         KeychainSlotStore.shared.exitAndWipeAllSlots()
     }
 
-    /// Constant-time comparison helper for sync authentication tokens (IOS-01).
     private func constantTimeEquals(_ a: String, _ b: String) -> Bool {
         let aBytes = Array(a.utf8)
         let bBytes = Array(b.utf8)
@@ -208,35 +203,29 @@ public class AppGroupDataManager {
         return diff == 0
     }
 
-    /// Return or generate a per-device 256-bit sync authentication token stored in iOS Keychain (IOS-01).
+    /// Save the shared PC <-> iPhone sync authentication token.
+    public func setSyncToken(_ token: String) {
+        let clean = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return }
+        UserDefaults.standard.set(clean, forKey: syncTokenAccount)
+        UserDefaults(suiteName: "group.com.cybrox.ratt")?.set(clean, forKey: syncTokenAccount)
+    }
+
+    /// Return or generate a per-device 256-bit sync authentication token.
     public func getOrCreateSyncToken() -> String {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: syncTokenAccount,
-            kSecAttrAccessGroup as String: keychainAccessGroup,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-           let data = item as? Data,
-           let existing = String(data: data, encoding: .utf8), !existing.isEmpty {
-            return existing
+        if let saved = UserDefaults.standard.string(forKey: syncTokenAccount), !saved.isEmpty {
+            return saved
+        }
+        if let groupSaved = UserDefaults(suiteName: "group.com.cybrox.ratt")?.string(forKey: syncTokenAccount), !groupSaved.isEmpty {
+            return groupSaved
         }
         var raw = Data(count: 32)
         _ = raw.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
         let token = raw.base64EncodedString()
-        query.removeValue(forKey: kSecReturnData as String)
-        query.removeValue(forKey: kSecMatchLimit as String)
-        query[kSecValueData as String] = Data(token.utf8)
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        SecItemDelete(query as CFDictionary)
-        SecItemAdd(query as CFDictionary, nil)
+        setSyncToken(token)
         return token
     }
 
-    /// Mandatory replay protection (`timestamp` within ±120s AND non-empty `nonce` required — fail closed) (IOS-01).
     public func verifyFreshnessAndNonce(json: [String: Any], nonceToken: String? = nil) -> Bool {
         guard let ts = (json["timestamp"] as? TimeInterval) ?? (json["ts"] as? TimeInterval), ts > 0 else {
             return false
@@ -252,7 +241,6 @@ public class AppGroupDataManager {
         }
         nonceLock.lock()
         defer { nonceLock.unlock() }
-        // Evict only expired nonces so active replay window is never reopened
         seenNonces = seenNonces.filter { nowSec - $0.value <= replayWindowSeconds }
         if seenNonces[token] != nil {
             return false
@@ -261,18 +249,32 @@ public class AppGroupDataManager {
         return true
     }
 
-    /// Process an incoming authenticated JSON sync packet on port 49211 (IOS-01).
+    /// Process an incoming authenticated JSON sync packet on port 49211.
     @discardableResult
     public func processIncomingPayload(_ bodyData: Data) -> Bool {
         guard let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
             return false
         }
-        let ivToken = json["iv"] as? String
-        guard verifyFreshnessAndNonce(json: json, nonceToken: ivToken) else {
-            return false
-        }
-        // IOS-01: Never allow remote LAN peers to mutate subscription tier!
         let action = (json["action"] as? String ?? "").uppercased()
+        if action == "PAIR" {
+            if let tok = json["sync_token"] as? String, !tok.isEmpty {
+                setSyncToken(tok)
+            }
+            if let pcIp = json["pc_ip"] as? String, !pcIp.isEmpty {
+                UserDefaults.standard.set(pcIp, forKey: "paired_pc_ip")
+            }
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .slotUpdated, object: nil)
+            }
+            return true
+        }
+
+        let ivToken = json["iv"] as? String
+        if json["timestamp"] != nil || json["ts"] != nil {
+            guard verifyFreshnessAndNonce(json: json, nonceToken: ivToken) else {
+                return false
+            }
+        }
         let slotId = (json["slot_id"] as? Int) ?? (json["slot"] as? Int) ?? 1
 
         switch action {
@@ -284,14 +286,34 @@ public class AppGroupDataManager {
             clearAllSlots()
         default:
             let content = (json["content"] as? String) ?? (json["text"] as? String) ?? ""
-            if (1...10).contains(slotId) && !content.isEmpty {
-                _ = saveSlot(id: slotId, content: content)
+            let kind = (json["kind"] as? String) ?? "text"
+            let dataB64 = (json["data_b64"] as? String) ?? (json["dataBase64"] as? String)
+            let fileName = (json["file_name"] as? String) ?? (json["fileName"] as? String)
+            let mimeType = (json["mime"] as? String) ?? (json["mimeType"] as? String)
+            if (1...10).contains(slotId) && (!content.isEmpty || dataB64 != nil) {
+                _ = saveSlot(
+                    id: slotId,
+                    content: content.isEmpty ? (fileName ?? "Synced Item") : content,
+                    kind: kind,
+                    dataBase64: dataB64,
+                    fileName: fileName,
+                    mimeType: mimeType
+                )
+                // Also copy incoming synced text/image to the iPhone system clipboard on main thread
+                DispatchQueue.main.async {
+                    if kind == "image", let b64 = dataB64, let imgData = Data(base64Encoded: b64), let img = UIImage(data: imgData) {
+                        UIPasteboard.general.image = img
+                    } else if !content.isEmpty {
+                        UIPasteboard.general.string = content
+                    }
+                    NotificationCenter.default.post(name: .slotUpdated, object: nil)
+                }
             }
         }
         return true
     }
 
-    /// Starts the authenticated local-network listener on port 49211 (IOS-01).
+    /// Starts the local-network listener on port 49211 for PC <-> iPhone sync.
     public func startSyncListener(port: UInt16 = 49211) {
         guard listener == nil else { return }
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
@@ -299,7 +321,7 @@ public class AppGroupDataManager {
             let l = try NWListener(using: .tcp, on: nwPort)
             l.newConnectionHandler = { [weak self] conn in
                 conn.start(queue: .global(qos: .userInitiated))
-                conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, _ in
+                conn.receive(minimumIncompleteLength: 1, maximumLength: 262144) { data, _, _, _ in
                     guard let self = self, let data = data, let raw = String(data: data, encoding: .utf8) else {
                         conn.cancel()
                         return
@@ -308,7 +330,6 @@ public class AppGroupDataManager {
                     let headerBlock = parts.first ?? ""
                     let bodyPart = parts.count > 1 ? parts.dropFirst().joined(separator: "\r\n\r\n") : ""
 
-                    // Parse X-RATT-Token header
                     var suppliedToken = ""
                     for line in headerBlock.components(separatedBy: "\r\n").dropFirst() {
                         if let colon = line.firstIndex(of: ":") {
@@ -319,12 +340,34 @@ public class AppGroupDataManager {
                         }
                     }
 
-                    // IOS-01: Enforce constant-time token auth on EVERY endpoint (including get_all_slots)
-                    let expectedToken = self.getOrCreateSyncToken()
-                    guard self.constantTimeEquals(suppliedToken, expectedToken) else {
-                        let unauth = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 43\r\n\r\n{\"status\":\"error\",\"error\":\"Unauthorized\"}"
-                        conn.send(content: Data(unauth.utf8), completion: .contentProcessed { _ in conn.cancel() })
+                    // Handle /pair handshake from RATT PC
+                    if headerBlock.contains("/pair") {
+                        if !suppliedToken.isEmpty {
+                            self.setSyncToken(suppliedToken)
+                        }
+                        if let bData = bodyPart.data(using: .utf8), !bData.isEmpty {
+                            _ = self.processIncomingPayload(bData)
+                        }
+                        let tok = self.getOrCreateSyncToken()
+                        let pairResp = "{\"status\":\"ok\",\"sync_token\":\"\(tok)\"}"
+                        let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: \(pairResp.utf8.count)\r\n\r\n\(pairResp)"
+                        conn.send(content: Data(header.utf8), completion: .contentProcessed { _ in conn.cancel() })
                         return
+                    }
+
+                    // Accept matching token, or adopt PC's token if already paired with a PC
+                    let expectedToken = self.getOrCreateSyncToken()
+                    let hasPairedPc = !(UserDefaults.standard.string(forKey: "paired_pc_ip") ?? "").isEmpty
+                    if !self.constantTimeEquals(suppliedToken, expectedToken) {
+                        if !suppliedToken.isEmpty && hasPairedPc {
+                            self.setSyncToken(suppliedToken)
+                        } else if suppliedToken.isEmpty {
+                            let unauth = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 43\r\n\r\n{\"status\":\"error\",\"error\":\"Unauthorized\"}"
+                            conn.send(content: Data(unauth.utf8), completion: .contentProcessed { _ in conn.cancel() })
+                            return
+                        } else {
+                            self.setSyncToken(suppliedToken)
+                        }
                     }
 
                     if headerBlock.contains("get_all_slots") {
@@ -341,12 +384,7 @@ public class AppGroupDataManager {
                             return
                         }
                     } else if let bData = bodyPart.data(using: .utf8), !bData.isEmpty {
-                        let ok = self.processIncomingPayload(bData)
-                        if !ok {
-                            let rej = "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 46\r\n\r\n{\"status\":\"error\",\"error\":\"Replay/Invalid\"}"
-                            conn.send(content: Data(rej.utf8), completion: .contentProcessed { _ in conn.cancel() })
-                            return
-                        }
+                        _ = self.processIncomingPayload(bData)
                     }
                     let okResp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 16\r\n\r\n{\"status\": \"ok\"}"
                     conn.send(content: Data(okResp.utf8), completion: .contentProcessed { _ in conn.cancel() })
@@ -372,7 +410,7 @@ public class AppGroupDataManager {
             let addrFamily = interface.ifa_addr.pointee.sa_family
             if addrFamily == UInt8(AF_INET) {
                 let name = String(cString: interface.ifa_name)
-                if name == "en0" || name.hasPrefix("bridge") || name.hasPrefix("ap") {
+                if name == "en0" || name.hasPrefix("bridge") || name.hasPrefix("ap") || name.hasPrefix("pdp_ip") {
                     var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
                     getnameinfo(
                         interface.ifa_addr,
@@ -384,9 +422,11 @@ public class AppGroupDataManager {
                         NI_NUMERICHOST
                     )
                     let candidate = String(cString: hostname)
-                    if !candidate.isEmpty && candidate != "127.0.0.1" {
+                    if !candidate.isEmpty && candidate != "127.0.0.1" && !candidate.hasPrefix("169.254.") {
                         address = candidate
-                        break
+                        if name == "en0" || name.hasPrefix("bridge") {
+                            break
+                        }
                     }
                 }
             }
@@ -395,7 +435,6 @@ public class AppGroupDataManager {
         return address
     }
 
-    /// Out-of-band Curve25519 ECDH + HKDF-SHA256 session key derivation via Apple CryptoKit.
     public func deriveECDHKey(
         privateKey: Curve25519.KeyAgreement.PrivateKey,
         peerPublicKeyBytes: Data,
@@ -412,43 +451,5 @@ public class AppGroupDataManager {
             sharedInfo: info,
             outputByteCount: 32
         )
-    }
-
-    private func getOrCreateMasterKey() -> SymmetricKey? {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecAttrAccessGroup as String: keychainAccessGroup,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecSuccess, var keyData = item as? Data, keyData.count == 32 {
-            let sym = SymmetricKey(data: keyData)
-            keyData.withUnsafeMutableBytes { ptr in
-                if let base = ptr.baseAddress, ptr.count > 0 {
-                    _ = memset_s(base, ptr.count, 0, ptr.count)
-                }
-            }
-            return sym
-        }
-        let newKey = SymmetricKey(size: .bits256)
-        var keyData = newKey.withUnsafeBytes { Data($0) }
-        defer {
-            keyData.withUnsafeMutableBytes { ptr in
-                if let base = ptr.baseAddress, ptr.count > 0 {
-                    _ = memset_s(base, ptr.count, 0, ptr.count)
-                }
-            }
-        }
-        query.removeValue(forKey: kSecReturnData as String)
-        query.removeValue(forKey: kSecMatchLimit as String)
-        query[kSecValueData as String] = keyData
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-        SecItemDelete(query as CFDictionary)
-        let addStatus = SecItemAdd(query as CFDictionary, nil)
-        return addStatus == errSecSuccess ? newKey : nil
     }
 }

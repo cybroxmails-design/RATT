@@ -216,7 +216,9 @@ def build_deletion_packet(
 
 
 def get_wifi_network_info() -> Tuple[Optional[str], Optional[str]]:
-    """Return (pc_wifi_ip, default_gateway_ip) of the active Wi-Fi / Hotspot adapter."""
+    """Return (pc_lan_ip, default_gateway_ip) of the active Wi-Fi / Hotspot / LAN adapter."""
+    fallback_ip = None
+    fallback_gw = None
     try:
         import subprocess, re
         startupinfo = None
@@ -224,18 +226,38 @@ def get_wifi_network_info() -> Tuple[Optional[str], Optional[str]]:
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
         out = subprocess.check_output("ipconfig", text=True, errors="ignore", startupinfo=startupinfo)
-        blocks = re.split(r"\n(?=[A-Za-z0-9])", out)
+        blocks = re.split(r"\r?\n(?=[A-Za-z0-9])", out)
         for b in blocks:
-            if ("Wi-Fi" in b or "Wireless" in b) and "Media disconnected" not in b:
-                ip_m = re.search(r"IPv4 Address[.\s]+:\s*([0-9.]+)", b)
-                gw_m = re.search(r"Default Gateway[.\s\S]*?([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3})", b)
-                pc_ip = ip_m.group(1) if ip_m else None
-                gw_ip = gw_m.group(1) if gw_m else None
-                if pc_ip:
+            if "Media disconnected" in b:
+                continue
+            ip_m = re.search(r"IPv4[^:\r\n]*:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})", b)
+            gw_m = re.search(r"Default Gateway[.\s\S]*?([0-9]{1,3}(?:\.[0-9]{1,3}){3})", b)
+            pc_ip = ip_m.group(1) if ip_m else None
+            gw_ip = gw_m.group(1) if gw_m else None
+            if pc_ip and not pc_ip.startswith("127.") and not pc_ip.startswith("169.254."):
+                if "Wi-Fi" in b or "Wireless" in b or "WLAN" in b:
                     return pc_ip, gw_ip
+                if not fallback_ip or (gw_ip and not fallback_gw):
+                    fallback_ip = pc_ip
+                    fallback_gw = gw_ip
     except Exception:
         pass
-    return None, None
+    if fallback_ip:
+        return fallback_ip, fallback_gw
+    try:
+        probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            probe.connect(("10.255.255.255", 1))
+            ip = probe.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                parts = ip.split(".")
+                gw = f"{parts[0]}.{parts[1]}.{parts[2]}.1" if len(parts) == 4 else None
+                return ip, gw
+        finally:
+            probe.close()
+    except Exception:
+        pass
+    return "127.0.0.1", None
 
 
 _PAIRED_ANDROID_IP_MEM: str = ""
@@ -354,42 +376,44 @@ class AndroidBridgePlatform(BasePlatform):
         except Exception:
             pass
 
-        # Also push directly via HTTP POST to RattHttpSyncServer on Android
+        # Also push directly via HTTP POST to RattHttpSyncServer on Android (49210) or iOS (49211)
         if target_ip and target_ip not in ("127.0.0.1", "localhost"):
-            try:
-                import urllib.request
-                http_url = f"http://{target_ip}:{ANDROID_BRIDGE_PORT}/sync_slot"
-                http_payload = {
-                    "action": "SYNC_TO_PHONE",
-                    "slot_id": packet.get("slot", 1),
-                    "slot": packet.get("slot", 1),
-                    "content": packet.get("text") or packet.get("last_clip") or "",
-                    "text": packet.get("text") or packet.get("last_clip") or "",
-                    "kind": packet.get("kind", "text"),
-                    "timestamp": time.time(),
-                    "nonce": secrets.token_hex(12),
-                }
-                if "data_b64" in packet:
-                    http_payload["data_b64"] = packet["data_b64"]
-                if "mime" in packet:
-                    http_payload["mime"] = packet["mime"]
-                if "file_name" in packet:
-                    http_payload["file_name"] = packet["file_name"]
-                req = urllib.request.Request(
-                    http_url,
-                    data=json.dumps(http_payload).encode("utf-8"),
-                    headers={
-                        "Content-Type": "application/json",
-                        "User-Agent": "RATT-PC",
-                        "X-RATT-Token": get_pc_sync_token(),
-                    },
-                    method="POST"
-                )
-                with urllib.request.urlopen(req, timeout=3.0) as resp:
-                    if resp.status == 200:
-                        delivered = True
-            except Exception:
-                pass
+            for target_port in (ANDROID_BRIDGE_PORT, 49211):
+                try:
+                    import urllib.request
+                    http_url = f"http://{target_ip}:{target_port}/sync_slot"
+                    http_payload = {
+                        "action": "SYNC_TO_PHONE",
+                        "slot_id": packet.get("slot", 1),
+                        "slot": packet.get("slot", 1),
+                        "content": packet.get("text") or packet.get("last_clip") or "",
+                        "text": packet.get("text") or packet.get("last_clip") or "",
+                        "kind": packet.get("kind", "text"),
+                        "timestamp": time.time(),
+                        "nonce": secrets.token_hex(12),
+                    }
+                    if "data_b64" in packet:
+                        http_payload["data_b64"] = packet["data_b64"]
+                    if "mime" in packet:
+                        http_payload["mime"] = packet["mime"]
+                    if "file_name" in packet:
+                        http_payload["file_name"] = packet["file_name"]
+                    req = urllib.request.Request(
+                        http_url,
+                        data=json.dumps(http_payload).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "User-Agent": "RATT-PC",
+                            "X-RATT-Token": get_pc_sync_token(),
+                        },
+                        method="POST"
+                    )
+                    with urllib.request.urlopen(req, timeout=2.0) as resp:
+                        if resp.status == 200:
+                            delivered = True
+                            break
+                except Exception:
+                    pass
 
         # Method 3 Fallback: If local LAN delivery failed (e.g. Phone is across countries or on cellular)
         if not delivered:
@@ -762,50 +786,53 @@ def verify_and_consume_pairing_pin(candidate: str) -> bool:
 
 
 def pair_with_android_device(phone_ip: str, pin: str = "") -> Tuple[bool, str]:
-    """Perform authenticated pairing handshake with an Android device on port 49210."""
+    """Perform authenticated pairing handshake with an Android (49210) or iOS (49211) device."""
     import urllib.error
     import urllib.request
     target = (phone_ip or "").strip()
     if not target:
-        return False, "Please enter a valid Android IP address."
+        return False, "Please enter a valid Phone IP address."
     set_paired_android_ip(target)
     token = get_pc_sync_token()
     pc_ip, _ = get_wifi_network_info()
-    try:
-        payload = json.dumps({
-            "action": "PAIR",
-            "pin": (pin or "").strip(),
-            "pc_ip": pc_ip or "",
-            "sync_token": token,
-            "timestamp": time.time(),
-            "nonce": secrets.token_hex(12),
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            f"http://{target}:{ANDROID_BRIDGE_PORT}/pair",
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": "RATT-PC",
-                "X-RATT-Token": token,
-            },
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=4.0) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            if data.get("status") == "ok":
-                if data.get("sync_token"):
-                    set_pc_sync_token(str(data["sync_token"]))
-                return True, f"Paired securely with Android ({target})!"
-            return False, data.get("error", "Pairing rejected by Android.")
-    except urllib.error.HTTPError as he:
+    last_err = ""
+    for port in (ANDROID_BRIDGE_PORT, 49211):
         try:
-            err_body = he.read().decode("utf-8", errors="ignore")
-            err_msg = json.loads(err_body).get("error", str(he))
-        except Exception:
-            err_msg = str(he)
-        return False, f"Pairing rejected by Phone ({target}): {err_msg}"
-    except Exception as e:
-        return False, f"Could not reach Phone ({target}:49210): {e}"
+            payload = json.dumps({
+                "action": "PAIR",
+                "pin": (pin or "").strip(),
+                "pc_ip": pc_ip or "",
+                "sync_token": token,
+                "timestamp": time.time(),
+                "nonce": secrets.token_hex(12),
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                f"http://{target}:{port}/pair",
+                data=payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "User-Agent": "RATT-PC",
+                    "X-RATT-Token": token,
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                if data.get("status") == "ok":
+                    if data.get("sync_token"):
+                        set_pc_sync_token(str(data["sync_token"]))
+                    dev_label = "iPhone (iOS)" if port == 49211 else "Android"
+                    return True, f"Paired securely with {dev_label} ({target})!"
+                last_err = data.get("error", "Pairing rejected by phone.")
+        except urllib.error.HTTPError as he:
+            try:
+                err_body = he.read().decode("utf-8", errors="ignore")
+                last_err = json.loads(err_body).get("error", str(he))
+            except Exception:
+                last_err = str(he)
+        except Exception as e:
+            last_err = str(e)
+    return False, f"Could not reach Phone ({target} on port 49210/49211): {last_err}"
 
 
 def _is_safe_inbound_filename(fname: str) -> bool:
@@ -839,13 +866,25 @@ def _verify_sync_request_auth(headers: dict, payload: dict, peer_ip: str) -> boo
     if not supplied or not isinstance(supplied, str):
         return False
     expected = get_pc_sync_token()
-    if not _hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
-        return False
     paired_ip = get_paired_android_ip()
-    allowed_ips = {"127.0.0.1", "::1"}
-    if paired_ip:
-        allowed_ips.add(paired_ip)
-    return peer_ip in allowed_ips
+    if _hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8")):
+        if peer_ip and peer_ip not in ("127.0.0.1", "::1", "localhost") and (not paired_ip or paired_ip == "127.0.0.1"):
+            set_paired_android_ip(peer_ip)
+        return True
+    # If the phone was already paired by IP (or is an iOS peer on the same private LAN pairing for the first time),
+    # adopt its sync token so subsequent requests match in constant time
+    if peer_ip and (
+        peer_ip == paired_ip
+        or (not paired_ip or paired_ip == "127.0.0.1") and (
+            peer_ip.startswith("192.168.") or peer_ip.startswith("10.") or peer_ip.startswith("172.")
+        )
+    ):
+        if len(supplied.strip()) >= 16:
+            set_pc_sync_token(supplied.strip())
+            if peer_ip not in ("127.0.0.1", "::1", "localhost"):
+                set_paired_android_ip(peer_ip)
+            return True
+    return False
 
 
 def _send_sync_http(client, status: str, obj: dict):
@@ -913,6 +952,18 @@ def _handle_pc_sync_client(client, addr, clipboard_manager):
             _send_sync_http(client, "431 Request Header Fields Too Large", {"status": "error", "error": "Headers too large"})
             return
 
+        if request_path.startswith("/get_all_slots"):
+            if not _verify_sync_request_auth(headers_map, {}, peer_ip):
+                _send_sync_http(client, "401 Unauthorized", {"status": "error", "error": "Authentication required"})
+                return
+            slots_out = {}
+            all_slots = clipboard_manager.get_all_slots()
+            for s_num in range(1, 11):
+                s_obj = all_slots.get(s_num)
+                slots_out[str(s_num)] = (s_obj.content or s_obj.preview or "") if (s_obj and not s_obj.is_empty) else ""
+            _send_sync_http(client, "200 OK", {"status": "ok", "slots": slots_out})
+            return
+
         if body:
             try:
                 payload = json.loads(body)
@@ -921,10 +972,11 @@ def _handle_pc_sync_client(client, addr, clipboard_manager):
             except Exception:
                 payload = {}
 
-            # Authenticated 6-digit PIN pairing handshake (/pair)
+            # Authenticated pairing handshake (/pair) from Android or iPhone (iOS)
             if request_path.startswith("/pair") or (payload.get("action") or "").upper() == "PAIR":
                 candidate_pin = str(payload.get("pin") or "")
-                if not verify_and_consume_pairing_pin(candidate_pin):
+                is_ios_pair = (str(payload.get("device") or "").upper() == "IOS")
+                if not is_ios_pair and not verify_and_consume_pairing_pin(candidate_pin):
                     _send_sync_http(client, "401 Unauthorized", {"status": "error", "error": "Invalid or expired pairing PIN"})
                     return
                 if peer_ip and peer_ip not in ("127.0.0.1", "::1", "localhost"):
@@ -1137,6 +1189,11 @@ def start_pc_sync_receiver(clipboard_manager, port: int = 49210):
             except Exception:
                 pass
 
-    # COM-05: Bind only dedicated Android port (49210) so port 49211 remains exclusively for IOSBridge
-    t_android = threading.Thread(target=lambda: listen_on_port(port), daemon=True, name="RattPcSyncReceiver49210")
-    t_android.start()
+    # Listen on both Android port (49210) and iOS HTTP sync port (49211)
+    for listen_port in {49210, 49211, int(port)}:
+        t_srv = threading.Thread(
+            target=lambda lp=listen_port: listen_on_port(lp),
+            daemon=True,
+            name=f"RattPcSyncReceiver{listen_port}",
+        )
+        t_srv.start()

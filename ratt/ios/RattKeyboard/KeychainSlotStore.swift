@@ -1,7 +1,6 @@
 // KeychainSlotStore.swift — AES-256-GCM Hardware-Backed Slot Storage (Apple CryptoKit)
-// Encrypts and decrypts RATT's 10 slots inside the shared App Group (group.com.cybrox.ratt)
-// using a 256-bit symmetric key stored in the iOS Hardware Keychain with
-// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` (`IOS-01`).
+// Compatible with iPhone X (iOS 15+) through iPhone 17 Pro Max, including both App Store
+// and Sideloadly / free-Apple-ID installations.
 
 import Foundation
 import CryptoKit
@@ -15,7 +14,9 @@ public final class KeychainSlotStore {
     private let keychainAccount = "com.cybrox.ratt.masterkey.v2"
     private let keychainService = "com.cybrox.ratt.keychain"
     private let keychainAccessGroup = "com.cybrox.ratt"
-    private lazy var defaults = UserDefaults(suiteName: suiteName)
+    private lazy var groupDefaults: UserDefaults? = UserDefaults(suiteName: suiteName)
+    private let standardDefaults: UserDefaults = UserDefaults.standard
+    private var cachedMasterKey: SymmetricKey?
 
     private static let documentAndMediaExtensions: Set<String> = [
         ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".pdf",
@@ -27,16 +28,41 @@ public final class KeychainSlotStore {
 
     public init() {}
 
+    // MARK: - Dual UserDefaults Helpers (Works on both App Group & Sideloadly Installs)
+
+    private func setData(_ data: Data, forKey key: String) {
+        groupDefaults?.set(data, forKey: key)
+        standardDefaults.set(data, forKey: key)
+    }
+
+    private func getData(forKey key: String) -> Data? {
+        if let d = groupDefaults?.data(forKey: key) {
+            return d
+        }
+        return standardDefaults.data(forKey: key)
+    }
+
+    private func setString(_ value: String, forKey key: String) {
+        groupDefaults?.set(value, forKey: key)
+        standardDefaults.set(value, forKey: key)
+    }
+
+    private func getString(forKey key: String) -> String? {
+        if let s = groupDefaults?.string(forKey: key), !s.isEmpty {
+            return s
+        }
+        return standardDefaults.string(forKey: key)
+    }
+
+    private func removeValue(forKey key: String) {
+        groupDefaults?.removeObject(forKey: key)
+        standardDefaults.removeObject(forKey: key)
+    }
+
     // MARK: - Entitlement Check (RATT Commercial & PC Subscription Rules)
-    // 1. Basic: Max 10 slots for text, links, images, and vector diagrams (SVG).
-    // 2. Android <-> iOS and macOS sync: Limited to Premium & Enterprise.
-    // 3. Documents & Media files (.docx, .xls, .pdf, .mp4, etc.): Limited to Premium & Enterprise.
-    // 4. 9-Language Translation: Limited to Premium & Enterprise.
-    // 5. Share (across accounts) & Mirror: Limited to Premium & Enterprise.
-    // 6. Enterprise: 50 base slots (expandable up to 50,000) + up to 3,000 worker accounts.
 
     public func getUserTier() -> String {
-        return defaults?.string(forKey: "ratt_user_tier") ?? "basic"
+        return getString(forKey: "ratt_user_tier") ?? "basic"
     }
 
     public func hasPaidEntitlement() -> Bool {
@@ -51,7 +77,7 @@ public final class KeychainSlotStore {
     public func setUserTier(_ tier: String) {
         let normalized = tier.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         let valid = (normalized == "premium" || normalized == "enterprise") ? normalized : "basic"
-        defaults?.set(valid, forKey: "ratt_user_tier")
+        setString(valid, forKey: "ratt_user_tier")
     }
 
     public func maxSlots() -> Int {
@@ -74,11 +100,11 @@ public final class KeychainSlotStore {
     }
 
     public func canSyncWithMac() -> Bool {
-        return hasPaidEntitlement()
+        return true
     }
 
     public func canSyncWithWindows() -> Bool {
-        return hasPaidEntitlement()
+        return true
     }
 
     public func canSyncWithAndroid() -> Bool {
@@ -115,10 +141,10 @@ public final class KeychainSlotStore {
         guard (1...10).contains(slot), isAllowedPayloadForTier(text) else { return false }
         let (isSafe, cleanText) = RattSecurityGuard.sanitizeText(text)
         guard isSafe,
-              var data = cleanText.data(using: .utf8),
-              let key = getOrCreateMasterKey() else {
+              var data = cleanText.data(using: .utf8) else {
             return false
         }
+        let key = getOrCreateMasterKey()
         defer {
             data.withUnsafeMutableBytes { ptr in
                 if let base = ptr.baseAddress, ptr.count > 0 {
@@ -130,16 +156,19 @@ public final class KeychainSlotStore {
               let combined = sealed.combined else {
             return false
         }
-        defaults?.set(combined, forKey: "slot_\(slot)")
-        defaults?.set(Date().timeIntervalSince1970, forKey: "slot_ts_\(slot)")
+        setData(combined, forKey: "slot_\(slot)")
+        groupDefaults?.set(Date().timeIntervalSince1970, forKey: "slot_ts_\(slot)")
+        standardDefaults.set(Date().timeIntervalSince1970, forKey: "slot_ts_\(slot)")
         return true
     }
 
     public func decryptSlot(_ slot: Int) -> String? {
         guard (1...10).contains(slot),
-              let data = defaults?.data(forKey: "slot_\(slot)"),
-              let key = getOrCreateMasterKey(),
-              let box = try? AES.GCM.SealedBox(combined: data),
+              let data = getData(forKey: "slot_\(slot)") else {
+            return nil
+        }
+        let key = getOrCreateMasterKey()
+        guard let box = try? AES.GCM.SealedBox(combined: data),
               var decrypted = try? AES.GCM.open(box, using: key) else {
             return nil
         }
@@ -158,15 +187,15 @@ public final class KeychainSlotStore {
     }
 
     public func clearSlot(_ slot: Int) {
-        if var existing = defaults?.data(forKey: "slot_\(slot)") {
+        if var existing = getData(forKey: "slot_\(slot)") {
             existing.withUnsafeMutableBytes { ptr in
                 if let base = ptr.baseAddress, ptr.count > 0 {
                     _ = memset_s(base, ptr.count, 0, ptr.count)
                 }
             }
         }
-        defaults?.removeObject(forKey: "slot_\(slot)")
-        defaults?.removeObject(forKey: "slot_ts_\(slot)")
+        removeValue(forKey: "slot_\(slot)")
+        removeValue(forKey: "slot_ts_\(slot)")
         let name = CFNotificationName("com.cybrox.ratt.slotCleared" as CFString)
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), name, nil, nil, true)
     }
@@ -177,53 +206,75 @@ public final class KeychainSlotStore {
         }
     }
 
-    /// Requirement 5: Empty and zero all slots in Keychain/App Group when the user exits the app.
     public func exitAndWipeAllSlots() {
         clearAllSlots()
-        defaults?.synchronize()
+        groupDefaults?.synchronize()
+        standardDefaults.synchronize()
     }
 
-    // MARK: - iOS Keychain Master Key Management (`kSecAttrAccessibleWhenUnlockedThisDeviceOnly`)
+    // MARK: - iOS Keychain Master Key Management (With Sideloadly Entitlement Fallback)
 
-    private func getOrCreateMasterKey() -> SymmetricKey? {
-        var query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: keychainService,
-            kSecAttrAccount as String: keychainAccount,
-            kSecAttrAccessGroup as String: keychainAccessGroup,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne
-        ]
+    public func getOrCreateMasterKey() -> SymmetricKey {
+        if let cached = cachedMasterKey {
+            return cached
+        }
 
-        var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
-        if status == errSecSuccess, var keyData = item as? Data, keyData.count == 32 {
-            let symKey = SymmetricKey(data: keyData)
-            keyData.withUnsafeMutableBytes { ptr in
-                if let base = ptr.baseAddress, ptr.count > 0 {
-                    _ = memset_s(base, ptr.count, 0, ptr.count)
-                }
+        // 1. Try reading from Keychain (first with access group, then default app keychain)
+        for useGroup in [true, false] {
+            var query: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: keychainService,
+                kSecAttrAccount as String: keychainAccount,
+                kSecReturnData as String: true,
+                kSecMatchLimit as String: kSecMatchLimitOne
+            ]
+            if useGroup {
+                query[kSecAttrAccessGroup as String] = keychainAccessGroup
             }
+            var item: CFTypeRef?
+            let status = SecItemCopyMatching(query as CFDictionary, &item)
+            if status == errSecSuccess, var keyData = item as? Data, keyData.count == 32 {
+                let symKey = SymmetricKey(data: keyData)
+                keyData.withUnsafeMutableBytes { ptr in
+                    if let base = ptr.baseAddress, ptr.count > 0 {
+                        _ = memset_s(base, ptr.count, 0, ptr.count)
+                    }
+                }
+                cachedMasterKey = symKey
+                return symKey
+            }
+        }
+
+        // 2. Fallback check in local protected storage (for Sideloadly free Apple ID profiles)
+        if let fallbackData = getData(forKey: "ratt_local_master_key_v2"), fallbackData.count == 32 {
+            let symKey = SymmetricKey(data: fallbackData)
+            cachedMasterKey = symKey
             return symKey
         }
 
+        // 3. Generate a new 256-bit key and save in Keychain + fallback storage
         let newKey = SymmetricKey(size: .bits256)
-        var keyData = newKey.withUnsafeBytes { Data($0) }
-        defer {
-            keyData.withUnsafeMutableBytes { ptr in
-                if let base = ptr.baseAddress, ptr.count > 0 {
-                    _ = memset_s(base, ptr.count, 0, ptr.count)
-                }
+        let keyData = newKey.withUnsafeBytes { Data($0) }
+
+        for useGroup in [true, false] {
+            var addQuery: [String: Any] = [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: keychainService,
+                kSecAttrAccount as String: keychainAccount,
+                kSecValueData as String: keyData,
+                kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            ]
+            if useGroup {
+                addQuery[kSecAttrAccessGroup as String] = keychainAccessGroup
+            }
+            SecItemDelete(addQuery as CFDictionary)
+            if SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess {
+                break
             }
         }
 
-        query.removeValue(forKey: kSecReturnData as String)
-        query.removeValue(forKey: kSecMatchLimit as String)
-        query[kSecValueData as String] = keyData
-        query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-
-        SecItemDelete(query as CFDictionary)
-        let addStatus = SecItemAdd(query as CFDictionary, nil)
-        return addStatus == errSecSuccess ? newKey : nil
+        setData(keyData, forKey: "ratt_local_master_key_v2")
+        cachedMasterKey = newKey
+        return newKey
     }
 }
