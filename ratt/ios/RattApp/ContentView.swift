@@ -62,8 +62,8 @@ public struct ContentView: View {
     @State private var showCrossSyncAlert: Bool = false
     @State private var crossSyncTarget: String = ""
     @State private var crossSyncIpInput: String = ""
-    @State private var pcIpAddress: String = "192.168.100.6"
-    @State private var iphoneIpAddress: String = "192.168.100.7"
+    @State private var pcIpAddress: String = ""
+    @State private var iphoneIpAddress: String = ""
 
     private let store = KeychainSlotStore.shared
     private let dataManager = AppGroupDataManager.shared
@@ -489,17 +489,16 @@ public struct ContentView: View {
             } message: {
                 Text(upgradeReason.isEmpty ? "Current Plan: \(userTier.rawValue.uppercased())\n\nBasic includes 10 slots for text, links, images & SVG diagrams. Cross-platform sync (Android/iOS/macOS), Documents & Media files, 9-Language Translation, and Share & Mirror require Premium or Enterprise." : upgradeReason)
             }
-            // Pairing Dialog
+            // Pairing Dialog (COM-05: No hardcoded developer LAN IPs)
             .alert("🔗 Pair with PC IP Address", isPresented: $showPairDialog) {
-                TextField("PC IP (e.g. 192.168.100.6)", text: $pcIpAddress)
+                TextField("PC IP (e.g. <your-pc-ip>)", text: $pcIpAddress)
                 Button("Save & Pair") {
-                    UserDefaults.standard.set(pcIpAddress, forKey: "paired_pc_ip")
-                    pushAllSlotsToPc()
-                }
-                Button("Use Default (192.168.100.6)") {
-                    pcIpAddress = "192.168.100.6"
-                    UserDefaults.standard.set(pcIpAddress, forKey: "paired_pc_ip")
-                    pushAllSlotsToPc()
+                    let cleanIp = pcIpAddress.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !cleanIp.isEmpty {
+                        pcIpAddress = cleanIp
+                        UserDefaults.standard.set(cleanIp, forKey: "paired_pc_ip")
+                        pushAllSlotsToPc()
+                    }
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
@@ -507,7 +506,7 @@ public struct ContentView: View {
             }
             // Cross-Platform Sync IP Prompt
             .alert("Sync with \(crossSyncTarget)", isPresented: $showCrossSyncAlert) {
-                TextField("IP Address (e.g. 192.168.100.7)", text: $crossSyncIpInput)
+                TextField("IP Address (e.g. <target-device-ip>)", text: $crossSyncIpInput)
                 Button("Sync Now") {
                     performCrossSync(target: crossSyncTarget, targetIp: crossSyncIpInput)
                 }
@@ -635,7 +634,7 @@ public struct ContentView: View {
     // ================= ACTIONS =================
 
     private func loadPreferences() {
-        let savedPc = UserDefaults.standard.string(forKey: "paired_pc_ip") ?? "192.168.100.6"
+        let savedPc = UserDefaults.standard.string(forKey: "paired_pc_ip") ?? ""
         self.pcIpAddress = savedPc
         self.iphoneIpAddress = dataManager.getDeviceIpAddress()
         self.userTier = RattUserTier(rawValue: store.getUserTier()) ?? .basic
@@ -698,7 +697,8 @@ public struct ContentView: View {
             sendSlotToPc(slotId: s, text: "")
         }
         emptySlotsOnExit()
-        exit(0)
+        // IOS-03: Avoid exit(0) (Apple App Store Guideline 2.5.1); wipe all slots cleanly in place
+        statusMessage = "All 10 slots securely wiped."
     }
 
     private func handleCrossSync(target: String) {
@@ -713,7 +713,7 @@ public struct ContentView: View {
             return
         }
         crossSyncTarget = target
-        crossSyncIpInput = target == "Android" ? "192.168.100.7" : "192.168.100.8"
+        crossSyncIpInput = ""
         showCrossSyncAlert = true
     }
 
@@ -747,6 +747,7 @@ public struct ContentView: View {
     private func performCrossSync(target: String, targetIp: String) {
         guard !targetIp.isEmpty else { return }
         let port = target == "Android" ? 49210 : 49211
+        let token = dataManager.getOrCreateSyncToken()
         for s in 1...10 {
             let text = store.decryptSlot(s) ?? ""
             guard let url = URL(string: "http://\(targetIp):\(port)/sync_slot") else { continue }
@@ -754,11 +755,13 @@ public struct ContentView: View {
             req.httpMethod = "POST"
             req.timeoutInterval = 2.0
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(token, forHTTPHeaderField: "X-RATT-Token")
             let payload: [String: Any] = [
                 "action": text.isEmpty ? "CLEAR_SLOT" : "SYNC_FROM_IOS",
                 "slot_id": s,
                 "content": text,
-                "tier": userTier.rawValue
+                "ts": Date().timeIntervalSince1970,
+                "nonce": UUID().uuidString
             ]
             req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
             URLSession.shared.dataTask(with: req).resume()
@@ -766,28 +769,21 @@ public struct ContentView: View {
     }
 
     private func sendSlotToPc(slotId: Int, text: String) {
-        guard let url = URL(string: "http://\(pcIpAddress):49211/sync_from_phone") else { return }
+        guard !pcIpAddress.isEmpty, let url = URL(string: "http://\(pcIpAddress):49211/sync_from_phone") else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.timeoutInterval = 2.0
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(dataManager.getOrCreateSyncToken(), forHTTPHeaderField: "X-RATT-Token")
         let payload: [String: Any] = [
             "action": text.isEmpty ? "CLEAR_SLOT" : "SYNC_FROM_PHONE",
             "slot_id": slotId,
-            "content": text
+            "content": text,
+            "ts": Date().timeIntervalSince1970,
+            "nonce": UUID().uuidString
         ]
         req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
-        URLSession.shared.dataTask(with: req) { data, _, _ in
-            if let data = data,
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let tier = json["tier"] as? String {
-                DispatchQueue.main.async {
-                    self.userTier = RattUserTier(rawValue: tier) ?? .basic
-                    self.store.setUserTier(tier)
-                    self.refreshSlots()
-                }
-            }
-        }.resume()
+        URLSession.shared.dataTask(with: req).resume()
     }
 
     private func sendClearSlotToPc(slotId: Int) {

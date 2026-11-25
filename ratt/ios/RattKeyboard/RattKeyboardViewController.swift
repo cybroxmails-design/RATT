@@ -60,28 +60,40 @@ class RattKeyboardViewController: UIInputViewController {
             statusBanner?.text = "Slot #\(slot.id) is not available on your plan."
             return
         }
+        // IOS-03: Use localOnly + 60s expiration so sensitive items never leak via Universal Clipboard
+        let pasteOpts: [UIPasteboard.OptionsKey: Any] = [
+            .localOnly: true,
+            .expirationDate: Date().addingTimeInterval(60)
+        ]
         // Phase 1: Native Images
         if slot.kind == "image" || slot.kind == "diagram" {
-            if let dataB64 = slot.dataBase64, let imgData = Data(base64Encoded: dataB64), let image = UIImage(data: imgData) {
-                UIPasteboard.general.image = image
-                UIPasteboard.general.setData(imgData, forPasteboardType: "public.png")
+            if let dataB64 = slot.dataBase64, let imgData = Data(base64Encoded: dataB64), UIImage(data: imgData) != nil {
+                UIPasteboard.general.setItems([["public.png": imgData]], options: pasteOpts)
                 let generator = UINotificationFeedbackGenerator()
                 generator.notificationOccurred(.success)
-                statusBanner?.text = "Image Slot #\(slot.id) copied to clipboard! Long-press to paste."
+                statusBanner?.text = "Image Slot #\(slot.id) copied locally (60s TTL)."
                 return
             }
         }
         // Phase 3: Documents and Media
         if slot.kind == "files" {
             let docName = slot.fileName ?? "Document"
+            guard RattSecurityGuard.isSafeFileName(docName) else {
+                statusBanner?.text = "Blocked unsafe file type: \(docName)"
+                return
+            }
             if let dataB64 = slot.dataBase64, let fileData = Data(base64Encoded: dataB64) {
                 let mime = slot.mimeType ?? "public.data"
-                UIPasteboard.general.setData(fileData, forPasteboardType: mime)
-                UIPasteboard.general.setData(fileData, forPasteboardType: "public.data")
+                UIPasteboard.general.setItems([[mime: fileData, "public.data": fileData]], options: pasteOpts)
             }
             let generator = UINotificationFeedbackGenerator()
             generator.notificationOccurred(.success)
-            statusBanner?.text = "\(docName) copied! Ready to paste/attach in app."
+            statusBanner?.text = "\(docName) copied locally (60s TTL)."
+            return
+        }
+        // IOS-03: Prevent accidental clipboard injection into secure password fields
+        if self.textDocumentProxy.isSecureTextEntry == true {
+            statusBanner?.text = "Injection blocked on secure password field."
             return
         }
         let (isSafe, clean) = RattSecurityGuard.sanitizeText(slot.content)

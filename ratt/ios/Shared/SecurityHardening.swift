@@ -41,15 +41,11 @@ public enum SecurityHardening {
         "/var/jb/usr/bin/su"
     ]
 
-    /// Runs all runtime anti-reverse-engineering checks.
+    /// Runs all App Store-compliant runtime anti-reverse-engineering checks (IOS-03).
     /// If a debugger, dynamic instrumentation dylib, or sandbox breach is detected,
     /// immediately zeroes and purges all slots from Keychain and App Group storage.
     @discardableResult
     public static func enforceRuntimeDefense() -> Bool {
-        #if !DEBUG
-        enablePtraceDenyAttach()
-        #endif
-
         let compromised = isDebuggerAttached() ||
             isSuspiciousDylibInjected() ||
             isDeviceJailbroken()
@@ -69,19 +65,6 @@ public enum SecurityHardening {
         let kResult = sysctl(&mib, UInt32(mib.count), &info, &size, nil, 0)
         guard kResult == 0 else { return false }
         return (info.kp_proc.p_flag & P_TRACED) != 0
-    }
-
-    /// 2. Invoke `ptrace(PT_DENY_ATTACH, 0, 0, 0)` dynamically to block user-space debugger attachment.
-    public static func enablePtraceDenyAttach() {
-        let ptDenyAttach: CInt = 31 // PT_DENY_ATTACH
-        guard let handle = dlopen(nil, RTLD_GLOBAL | RTLD_NOW),
-              let sym = dlsym(handle, "ptrace") else {
-            return
-        }
-        typealias PtraceFn = @convention(c) (CInt, pid_t, CInt, CInt) -> CInt
-        let ptraceCall = unsafeBitCast(sym, to: PtraceFn.self)
-        _ = ptraceCall(ptDenyAttach, 0, 0, 0)
-        dlclose(handle)
     }
 
     /// 3. Scan loaded Mach-O images via `_dyld_get_image_name` for Frida, Substrate, or Cycript injection.

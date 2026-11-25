@@ -2,7 +2,6 @@
 // Allows sharing photos, documents (.pdf, .docx), and links directly into RATT Slots 1-10
 
 import UIKit
-import Social
 import UniformTypeIdentifiers
 
 class ShareViewController: UIViewController {
@@ -101,6 +100,21 @@ class ShareViewController: UIViewController {
     }
 
     private func saveToSlot(_ slotId: Int) {
+        // IOS-02: Enforce blocked filename checks, 25 MB size cap, and tier entitlements before storing
+        if sharedKind == "files" {
+            if !KeychainSlotStore.shared.canCopyDocumentAndMediaFiles() {
+                extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
+                return
+            }
+            if let fname = sharedFileName, !RattSecurityGuard.isSafeFileName(fname) {
+                extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
+                return
+            }
+        }
+        if let rawData = sharedData, rawData.count > 25 * 1024 * 1024 {
+            extensionContext?.completeRequest(returningItems: [], completionHandler: nil)
+            return
+        }
         let content = sharedText ?? sharedFileName ?? "Shared Item"
         let b64 = sharedData?.base64EncodedString()
         dataManager.saveSlot(

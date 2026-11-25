@@ -54,12 +54,13 @@ public struct RattSlot: Codable, Identifiable {
 
 public class AppGroupDataManager {
     public static let shared = AppGroupDataManager()
-    private let groupURL: URL = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.cybrox.ratt")
-        ?? FileManager.default.temporaryDirectory
+    private let groupURL: URL? = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: "group.com.cybrox.ratt")
     private let keychainService = "com.cybrox.ratt.keychain"
     private let keychainAccount = "com.cybrox.ratt.masterkey.v2"
+    private let keychainAccessGroup = "com.cybrox.ratt"
+    private let syncTokenAccount = "com.cybrox.ratt.synctoken.v2"
     private let replayWindowSeconds: TimeInterval = 120.0
-    private var seenNonces: Set<String> = []
+    private var seenNonces: [String: TimeInterval] = [:]
     private let nonceLock = NSLock()
     private var listener: NWListener?
 
@@ -108,7 +109,8 @@ public class AppGroupDataManager {
               let combined = sealed.combined else {
             return false
         }
-        let slotFile = groupURL.appendingPathComponent("slot_\(id).enc")
+        guard let container = groupURL else { return false }
+        let slotFile = container.appendingPathComponent("slot_\(id).enc")
         try? combined.write(to: slotFile, options: [.atomic, .completeFileProtection])
         KeychainSlotStore.shared.encryptAndStore(slot: id, text: cleanText)
         NotificationCenter.default.post(name: .slotUpdated, object: nil)
@@ -117,8 +119,8 @@ public class AppGroupDataManager {
 
     /// Read and decrypt `slot_\(id).enc` from the shared App Group container.
     public func loadSlot(id: Int) -> RattSlot? {
-        guard (1...10).contains(id) else { return nil }
-        let slotFile = groupURL.appendingPathComponent("slot_\(id).enc")
+        guard (1...10).contains(id), let container = groupURL else { return nil }
+        let slotFile = container.appendingPathComponent("slot_\(id).enc")
         if let encryptedData = try? Data(contentsOf: slotFile),
            let key = getOrCreateMasterKey(),
            let box = try? AES.GCM.SealedBox(combined: encryptedData),
@@ -150,16 +152,18 @@ public class AppGroupDataManager {
 
     public func clearSlot(id: Int) {
         // Purges slot payload from shared container and zeroes file bytes via memset_s (MEM-003)
-        let slotFile = groupURL.appendingPathComponent("slot_\(id).enc")
-        if var existing = try? Data(contentsOf: slotFile) {
-            existing.withUnsafeMutableBytes { ptr in
-                if let base = ptr.baseAddress, ptr.count > 0 {
-                    _ = memset_s(base, ptr.count, 0, ptr.count)
+        if let container = groupURL {
+            let slotFile = container.appendingPathComponent("slot_\(id).enc")
+            if var existing = try? Data(contentsOf: slotFile) {
+                existing.withUnsafeMutableBytes { ptr in
+                    if let base = ptr.baseAddress, ptr.count > 0 {
+                        _ = memset_s(base, ptr.count, 0, ptr.count)
+                    }
                 }
+                try? existing.write(to: slotFile)
             }
-            try? existing.write(to: slotFile)
+            try? FileManager.default.removeItem(at: slotFile)
         }
-        try? FileManager.default.removeItem(at: slotFile)
         KeychainSlotStore.shared.clearSlot(id)
         // Dispatches cross-process Darwin notification to Keyboard Extension
         let name = CFNotificationName("com.cybrox.ratt.slotCleared" as CFString)
@@ -167,16 +171,18 @@ public class AppGroupDataManager {
     }
 
     public func clearAllSlots() {
-        for id in 1...10 {
-            let slotFile = groupURL.appendingPathComponent("slot_\(id).enc")
-            if var existing = try? Data(contentsOf: slotFile) {
-                existing.withUnsafeMutableBytes { ptr in
-                    if let base = ptr.baseAddress, ptr.count > 0 {
-                        _ = memset_s(base, ptr.count, 0, ptr.count)
+        if let container = groupURL {
+            for id in 1...10 {
+                let slotFile = container.appendingPathComponent("slot_\(id).enc")
+                if var existing = try? Data(contentsOf: slotFile) {
+                    existing.withUnsafeMutableBytes { ptr in
+                        if let base = ptr.baseAddress, ptr.count > 0 {
+                            _ = memset_s(base, ptr.count, 0, ptr.count)
+                        }
                     }
                 }
+                try? FileManager.default.removeItem(at: slotFile)
             }
-            try? FileManager.default.removeItem(at: slotFile)
         }
         KeychainSlotStore.shared.clearAllSlots()
         let name = CFNotificationName("com.cybrox.ratt.slotCleared" as CFString)
@@ -190,31 +196,72 @@ public class AppGroupDataManager {
         KeychainSlotStore.shared.exitAndWipeAllSlots()
     }
 
-    /// Replay protection (`timestamp` within ±120s and `nonce` deduplication).
+    /// Constant-time comparison helper for sync authentication tokens (IOS-01).
+    private func constantTimeEquals(_ a: String, _ b: String) -> Bool {
+        let aBytes = Array(a.utf8)
+        let bBytes = Array(b.utf8)
+        guard aBytes.count == bBytes.count, !aBytes.isEmpty else { return false }
+        var diff: UInt8 = 0
+        for i in 0..<aBytes.count {
+            diff |= (aBytes[i] ^ bBytes[i])
+        }
+        return diff == 0
+    }
+
+    /// Return or generate a per-device 256-bit sync authentication token stored in iOS Keychain (IOS-01).
+    public func getOrCreateSyncToken() -> String {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: syncTokenAccount,
+            kSecAttrAccessGroup as String: keychainAccessGroup,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne
+        ]
+        var item: CFTypeRef?
+        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+           let data = item as? Data,
+           let existing = String(data: data, encoding: .utf8), !existing.isEmpty {
+            return existing
+        }
+        var raw = Data(count: 32)
+        _ = raw.withUnsafeMutableBytes { SecRandomCopyBytes(kSecRandomDefault, 32, $0.baseAddress!) }
+        let token = raw.base64EncodedString()
+        query.removeValue(forKey: kSecReturnData as String)
+        query.removeValue(forKey: kSecMatchLimit as String)
+        query[kSecValueData as String] = Data(token.utf8)
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        SecItemDelete(query as CFDictionary)
+        SecItemAdd(query as CFDictionary, nil)
+        return token
+    }
+
+    /// Mandatory replay protection (`timestamp` within ±120s AND non-empty `nonce` required — fail closed) (IOS-01).
     public func verifyFreshnessAndNonce(json: [String: Any], nonceToken: String? = nil) -> Bool {
-        if let ts = (json["timestamp"] as? TimeInterval) ?? (json["ts"] as? TimeInterval), ts > 0 {
-            let nowSec = Date().timeIntervalSince1970
-            let normalizedTs = ts > 10_000_000_000 ? ts / 1000.0 : ts
-            if abs(nowSec - normalizedTs) > replayWindowSeconds {
-                return false
-            }
+        guard let ts = (json["timestamp"] as? TimeInterval) ?? (json["ts"] as? TimeInterval), ts > 0 else {
+            return false
+        }
+        let nowSec = Date().timeIntervalSince1970
+        let normalizedTs = ts > 10_000_000_000 ? ts / 1000.0 : ts
+        guard abs(nowSec - normalizedTs) <= replayWindowSeconds else {
+            return false
         }
         let token = nonceToken ?? (json["nonce"] as? String ?? "")
-        if !token.isEmpty {
-            nonceLock.lock()
-            defer { nonceLock.unlock() }
-            if seenNonces.contains(token) {
-                return false
-            }
-            if seenNonces.count >= 512 {
-                seenNonces.removeAll()
-            }
-            seenNonces.insert(token)
+        guard !token.isEmpty else {
+            return false
         }
+        nonceLock.lock()
+        defer { nonceLock.unlock() }
+        // Evict only expired nonces so active replay window is never reopened
+        seenNonces = seenNonces.filter { nowSec - $0.value <= replayWindowSeconds }
+        if seenNonces[token] != nil {
+            return false
+        }
+        seenNonces[token] = nowSec
         return true
     }
 
-    /// Process an incoming JSON or AES-256-GCM sync packet on port 49211 (Parity with Android `SlotRepository.processIncomingWireLine`).
+    /// Process an incoming authenticated JSON sync packet on port 49211 (IOS-01).
     @discardableResult
     public func processIncomingPayload(_ bodyData: Data) -> Bool {
         guard let json = try? JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
@@ -224,9 +271,7 @@ public class AppGroupDataManager {
         guard verifyFreshnessAndNonce(json: json, nonceToken: ivToken) else {
             return false
         }
-        if let tier = json["tier"] as? String, !tier.isEmpty {
-            KeychainSlotStore.shared.setUserTier(tier)
-        }
+        // IOS-01: Never allow remote LAN peers to mutate subscription tier!
         let action = (json["action"] as? String ?? "").uppercased()
         let slotId = (json["slot_id"] as? Int) ?? (json["slot"] as? Int) ?? 1
 
@@ -246,7 +291,7 @@ public class AppGroupDataManager {
         return true
     }
 
-    /// Starts the background local-network listener on port 49211 (Parity with Android `RattHttpSyncServer`).
+    /// Starts the authenticated local-network listener on port 49211 (IOS-01).
     public func startSyncListener(port: UInt16 = 49211) {
         guard listener == nil else { return }
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
@@ -255,25 +300,52 @@ public class AppGroupDataManager {
             l.newConnectionHandler = { [weak self] conn in
                 conn.start(queue: .global(qos: .userInitiated))
                 conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, _, _ in
-                    if let data = data, let raw = String(data: data, encoding: .utf8) {
-                        if raw.contains("get_all_slots") {
-                            var slotsDict: [String: String] = [:]
-                            for idx in 1...10 {
-                                slotsDict["\(idx)"] = self?.loadSlot(id: idx)?.content ?? ""
+                    guard let self = self, let data = data, let raw = String(data: data, encoding: .utf8) else {
+                        conn.cancel()
+                        return
+                    }
+                    let parts = raw.components(separatedBy: "\r\n\r\n")
+                    let headerBlock = parts.first ?? ""
+                    let bodyPart = parts.count > 1 ? parts.dropFirst().joined(separator: "\r\n\r\n") : ""
+
+                    // Parse X-RATT-Token header
+                    var suppliedToken = ""
+                    for line in headerBlock.components(separatedBy: "\r\n").dropFirst() {
+                        if let colon = line.firstIndex(of: ":") {
+                            let k = line[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
+                            if k == "x-ratt-token" {
+                                suppliedToken = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
                             }
-                            let respObj: [String: Any] = ["status": "ok", "slots": slotsDict]
-                            if let respData = try? JSONSerialization.data(withJSONObject: respObj) {
-                                let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: \(respData.count)\r\n\r\n"
-                                var out = Data(header.utf8)
-                                out.append(respData)
-                                conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
-                                return
-                            }
-                        } else {
-                            let bodyPart = raw.components(separatedBy: "\r\n\r\n").last ?? raw
-                            if let bData = bodyPart.data(using: .utf8) {
-                                _ = self?.processIncomingPayload(bData)
-                            }
+                        }
+                    }
+
+                    // IOS-01: Enforce constant-time token auth on EVERY endpoint (including get_all_slots)
+                    let expectedToken = self.getOrCreateSyncToken()
+                    guard self.constantTimeEquals(suppliedToken, expectedToken) else {
+                        let unauth = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 43\r\n\r\n{\"status\":\"error\",\"error\":\"Unauthorized\"}"
+                        conn.send(content: Data(unauth.utf8), completion: .contentProcessed { _ in conn.cancel() })
+                        return
+                    }
+
+                    if headerBlock.contains("get_all_slots") {
+                        var slotsDict: [String: String] = [:]
+                        for idx in 1...10 {
+                            slotsDict["\(idx)"] = self.loadSlot(id: idx)?.content ?? ""
+                        }
+                        let respObj: [String: Any] = ["status": "ok", "slots": slotsDict]
+                        if let respData = try? JSONSerialization.data(withJSONObject: respObj) {
+                            let header = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: \(respData.count)\r\n\r\n"
+                            var out = Data(header.utf8)
+                            out.append(respData)
+                            conn.send(content: out, completion: .contentProcessed { _ in conn.cancel() })
+                            return
+                        }
+                    } else if let bData = bodyPart.data(using: .utf8), !bData.isEmpty {
+                        let ok = self.processIncomingPayload(bData)
+                        if !ok {
+                            let rej = "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 46\r\n\r\n{\"status\":\"error\",\"error\":\"Replay/Invalid\"}"
+                            conn.send(content: Data(rej.utf8), completion: .contentProcessed { _ in conn.cancel() })
+                            return
                         }
                     }
                     let okResp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: 16\r\n\r\n{\"status\": \"ok\"}"
@@ -347,6 +419,7 @@ public class AppGroupDataManager {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
             kSecAttrAccount as String: keychainAccount,
+            kSecAttrAccessGroup as String: keychainAccessGroup,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]

@@ -9,17 +9,17 @@
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
     <key>CFBundleIdentifier</key>
-    <string>com.cybrox.ratt.share</string>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
-    <string>$(PRODUCT_NAME)</string>
+    <string>RattShareExtension</string>
     <key>CFBundlePackageType</key>
-    <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
+    <string>XPC!</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.0</string>
+    <string>2.0.0</string>
     <key>CFBundleVersion</key>
-    <string>200</string>
+    <string>2</string>
     <key>NSExtension</key>
     <dict>
         <key>NSExtensionAttributes</key>

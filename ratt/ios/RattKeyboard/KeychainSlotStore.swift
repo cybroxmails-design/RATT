@@ -14,6 +14,7 @@ public final class KeychainSlotStore {
     private let suiteName = "group.com.cybrox.ratt"
     private let keychainAccount = "com.cybrox.ratt.masterkey.v2"
     private let keychainService = "com.cybrox.ratt.keychain"
+    private let keychainAccessGroup = "com.cybrox.ratt"
     private lazy var defaults = UserDefaults(suiteName: suiteName)
 
     private static let documentAndMediaExtensions: Set<String> = [
@@ -56,9 +57,9 @@ public final class KeychainSlotStore {
     public func maxSlots() -> Int {
         switch getUserTier() {
         case "enterprise":
-            return 50
-        case "premium":
             return 50_000
+        case "premium":
+            return 50
         default:
             return 10
         }
@@ -189,6 +190,7 @@ public final class KeychainSlotStore {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
             kSecAttrAccount as String: keychainAccount,
+            kSecAttrAccessGroup as String: keychainAccessGroup,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]

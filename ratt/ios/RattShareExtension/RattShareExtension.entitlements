@@ -6,5 +6,9 @@
     <array>
         <string>group.com.cybrox.ratt</string>
     </array>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)com.cybrox.ratt</string>
+    </array>
 </dict>
 </plist>
